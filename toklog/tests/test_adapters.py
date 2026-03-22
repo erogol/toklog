@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Tests for toklog.adapters — SSEStreamBuffer, OpenAI, Anthropic, and Gemini adapters.
 
 Tests covering:
