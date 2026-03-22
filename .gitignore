@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.env
+.env.*
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.pytest_cache/
+
+# Internal planning docs (local only)
+CLAUDE.md
+keche.md
+SPEC.md
+TODO.md
+VALIDATION.md
+PHASE2_VALIDATION.md
+PROGRAM_BREAKDOWN_TFF.md
+PROXY_TFF.md
+REPORT_FILTER_TFF.md
+TECHNICAL_DESIGN.md
+TECHNICAL_SPEC.md
+features/

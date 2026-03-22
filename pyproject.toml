@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toklog"
+version = "0.2.0"
+description = "Local-first proxy for LLM spend visibility and control."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+keywords = ["llm", "proxy", "tokens", "cost", "observability"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "click>=8.0",
+    "rich>=12.0",
+    "starlette>=0.37",
+    "uvicorn>=0.29",
+    "httpx>=0.25",
+]
+
+[project.optional-dependencies]
+share = ["jinja2>=3.0"]
+dev = ["pytest", "pytest-cov", "pytest-asyncio", "jinja2>=3.0"]
+
+[project.scripts]
+tl = "toklog.cli:cli"
+
+[tool.setuptools.package-data]
+toklog = ["templates/*.j2", "py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+
+[tool.setuptools.packages.find]
+include = ["toklog*"]

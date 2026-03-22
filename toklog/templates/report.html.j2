@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TokLog Report</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #0d1117;
+  color: #e6edf3;
+  font-family: system-ui, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 24px 16px;
+}
+.container { max-width: 900px; margin: 0 auto; }
+h1 { font-size: 22px; font-weight: 700; color: #58a6ff; margin-bottom: 4px; }
+.subtitle { color: #8b949e; font-size: 13px; margin-bottom: 24px; }
+.cards { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
+.card {
+  flex: 1; min-width: 180px;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 16px;
+  background: #161b22;
+}
+.card-label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+.card-value { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.card-value.warn { color: #f0883e; }
+.card-value.neutral { color: #e6edf3; }
+.section-title { font-size: 16px; font-weight: 600; color: #e6edf3; margin: 28px 0 12px; border-bottom: 1px solid #21262d; padding-bottom: 8px; }
+table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+th {
+  text-align: left;
+  color: #8b949e;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 8px 12px;
+  border-bottom: 1px solid #21262d;
+}
+td { padding: 8px 12px; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums; }
+tr:nth-child(odd) td { background: #161b22; }
+tr:nth-child(even) td { background: #0d1117; }
+.right { text-align: right; }
+.chart-wrap { margin-bottom: 24px; overflow-x: auto; }
+.chart-label { fill: #e6edf3; font-size: 12px; font-family: system-ui, sans-serif; }
+.chart-value { fill: #8b949e; font-size: 11px; font-family: system-ui, sans-serif; }
+.detectors { list-style: none; }
+.detector-item { padding: 10px 0; border-bottom: 1px solid #21262d; display: flex; align-items: flex-start; gap: 10px; }
+.detector-icon { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+.detector-name { font-weight: 600; }
+.detector-waste { color: #f0883e; font-size: 13px; }
+.detector-ok { color: #3fb950; }
+.fix-code { background: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 8px 10px; font-family: 'Courier New', monospace; font-size: 12px; color: #a5d6ff; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
+footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid #21262d; color: #8b949e; font-size: 12px; }
+footer a { color: #58a6ff; text-decoration: none; }
+@media print {
+  body { background: #fff; color: #000; }
+  .card { border-color: #ccc; background: #f8f8f8; }
+  .card-value.warn { color: #c44; }
+  td, th { color: #000; }
+  tr:nth-child(odd) td, tr:nth-child(even) td { background: transparent; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>TokLog Report</h1>
+  <p class="subtitle">Generated {{ generated_at }}{% if report.period %} &mdash; period: {{ report.period }}{% endif %}</p>
+
+  <!-- Summary cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Total Spend</div>
+      <div class="card-value neutral">${{ "%.2f"|format(report.total_spend_usd) }}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Waste Detected</div>
+      <div class="card-value {% if report.estimated_waste_usd > 0 %}warn{% else %}neutral{% endif %}">
+        ${{ "%.2f"|format(report.estimated_waste_usd) }}
+        {% if report.waste_pct > 0 %}<span style="font-size:14px;font-weight:400"> ({{ report.waste_pct }}%)</span>{% endif %}
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-label">Total Calls</div>
+      <div class="card-value neutral">{{ "{:,}".format(report.total_calls) }}</div>
+    </div>
+    {% if gain and gain.total_waste_detected_usd is defined %}
+    <div class="card">
+      <div class="card-label">Cumulative Waste Found</div>
+      <div class="card-value warn">${{ "%.2f"|format(gain.total_waste_detected_usd) }}</div>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Top Models Bar Chart -->
+  {% if report.cost_by_model %}
+  {% set models = report.cost_by_model.items() | list %}
+  {% set max_cost = models | map(attribute='1') | map(attribute='cost_usd') | max %}
+  <h2 class="section-title">Top Models by Spend</h2>
+  <div class="chart-wrap">
+    <svg width="860" height="{{ [models|length * 36 + 20, 60]|max }}" xmlns="http://www.w3.org/2000/svg">
+      {% for model_name, model_data in models %}
+      {% set bar_w = (model_data.cost_usd / max_cost * 400) | int if max_cost > 0 else 0 %}
+      {% set y = loop.index0 * 36 + 10 %}
+      <text x="0" y="{{ y + 16 }}" class="chart-label" style="fill:#e6edf3">{{ model_name | truncate(28, true, '…') }}</text>
+      <rect x="230" y="{{ y }}" width="{{ bar_w }}" height="22" rx="3" fill="#58a6ff" opacity="0.7"/>
+      <text x="{{ 230 + bar_w + 6 }}" y="{{ y + 16 }}" class="chart-value">${{ "%.4f"|format(model_data.cost_usd) }}</text>
+      {% endfor %}
+    </svg>
+  </div>
+
+  <!-- Top Models Table -->
+  <table>
+    <thead>
+      <tr><th>Model</th><th class="right">Calls</th><th class="right">Tokens</th><th class="right">Cost $</th></tr>
+    </thead>
+    <tbody>
+      {% for model_name, model_data in models %}
+      <tr>
+        <td>{{ model_name }}</td>
+        <td class="right">{{ "{:,}".format(model_data.calls) }}</td>
+        <td class="right">{{ "{:,}".format(model_data.tokens) }}</td>
+        <td class="right">${{ "%.4f"|format(model_data.cost_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <!-- Cost by Call Site -->
+  {% if report.cost_by_call_site %}
+  <h2 class="section-title">Cost by Call Site</h2>
+  <table>
+    <thead>
+      <tr><th>Call Site</th><th class="right">Calls</th><th class="right">Tokens</th><th class="right">Cost $</th><th class="right">%</th></tr>
+    </thead>
+    <tbody>
+      {% for row in report.cost_by_call_site %}
+      <tr>
+        <td>{{ row.call_site }}</td>
+        <td class="right">{{ "{:,}".format(row.calls) }}</td>
+        <td class="right">{{ "{:,}".format(row.tokens) }}</td>
+        <td class="right">${{ "%.4f"|format(row.cost_usd) }}</td>
+        <td class="right">{{ row.pct }}%</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <!-- Cost by Context Driver -->
+  {% if report.cost_by_context_driver %}
+  <h2 class="section-title">Cost by Context Driver</h2>
+  <table>
+    <thead>
+      <tr><th>Driver</th><th class="right">Calls</th><th class="right">Tokens</th><th class="right">Cost $</th><th class="right">%</th></tr>
+    </thead>
+    <tbody>
+      {% for row in report.cost_by_context_driver %}
+      <tr>
+        <td>{{ row.name }}</td>
+        <td class="right">{{ "{:,}".format(row.calls) }}</td>
+        <td class="right">{{ "{:,}".format(row.tokens) }}</td>
+        <td class="right">${{ "%.4f"|format(row.cost_usd) }}</td>
+        <td class="right">{{ row.pct }}%</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <!-- Waste Detectors -->
+  {% if report.detectors %}
+  <h2 class="section-title">Waste Detectors</h2>
+  <ul class="detectors">
+    {% for det in report.detectors %}
+    <li class="detector-item">
+      {% if det.triggered %}
+      <span class="detector-icon">&#9888;</span>
+      <div>
+        <div class="detector-name">{{ det.name }} <span class="detector-waste">— est. waste ${{ "%.4f"|format(det.estimated_waste_usd) }}</span></div>
+        <div style="color:#8b949e; font-size:13px; margin-top:2px;">{{ det.description }}</div>
+      </div>
+      {% else %}
+      <span class="detector-icon detector-ok">&#10003;</span>
+      <div>
+        <span class="detector-name" style="color:#8b949e;">{{ det.name }}</span>
+        <span style="color:#3fb950; font-size:12px; margin-left:8px;">OK</span>
+      </div>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  <footer>
+    Generated by <a href="https://github.com/erogol/toklog" target="_blank">TokLog</a>
+  </footer>
+</div>
+
+<script>
+  const reportData = {{ report_json | safe }};
+  const gainData = {{ gain_json | safe }};
+</script>
+</body>
+</html>

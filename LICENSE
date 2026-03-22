@@ -1,0 +1,37 @@
+TokLog Fair Use License (TBFUL) v1.0
+
+Copyright (c) 2026 Eren Gölge
+
+Permission is granted to any person to use, copy, modify, and distribute
+this software, subject to the following conditions:
+
+1. NON-COMMERCIAL USE
+   Free. No strings. Use it, learn from it, hack on it, run it internally
+   for your team. Go wild.
+
+2. COMMERCIAL USE
+   If you or your organization generate revenue using this software —
+   whether directly (selling it, wrapping it in a product, offering it
+   as a service) or indirectly (using it to reduce costs that you then
+   profit from at scale) — you must obtain a commercial license from the
+   copyright holder.
+
+   "At scale" means annual LLM spend exceeding $10,000 USD routed through
+   TokLog. Below that, you're good.
+
+3. NO RELABELING
+   You may not remove this license, rebrand the software, or present it
+   as your own original work.
+
+4. CONTRIBUTIONS
+   Code contributed back to this project is licensed under these same terms.
+   You keep your copyright, but the contribution ships under this license.
+
+5. NO WARRANTY
+   This software is provided "as is", without warranty of any kind.
+   The author is not liable for any damages arising from its use.
+
+In plain English: use it for free, build cool things with it, share it
+with friends. But if you're making money off it, pay your fair share.
+
+Contact: eren@toklog.dev
