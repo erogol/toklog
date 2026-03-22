@@ -291,44 +291,6 @@ class TestAnthropicResponseId:
         assert "response_id" in AnthropicUsageResult.__dataclass_fields__, "Anthropic missing response_id"
 
 
-# ===========================================================================
-# 3. __init__.py re-exports
-# ===========================================================================
-
-class TestAdapterReExports:
-    """The adapters __init__.py should export the main types."""
-
-    def test_import_usage_results(self) -> None:
-        from toklog.adapters import (
-            OpenAIUsageResult,
-            AnthropicUsageResult,
-            GeminiUsageResult,
-        )
-        # Verify they're the actual classes
-        assert OpenAIUsageResult.__name__ == "UsageResult"
-        assert AnthropicUsageResult.__name__ == "AnthropicUsageResult"
-        assert GeminiUsageResult.__name__ == "GeminiUsageResult"
-
-    def test_import_event_handlers(self) -> None:
-        from toklog.adapters import (
-            OpenAIEventHandler,
-            AnthropicEventHandler,
-            GeminiEventHandler,
-        )
-        assert OpenAIEventHandler.__name__ == "OpenAIEventHandler"
-        assert AnthropicEventHandler.__name__ == "AnthropicEventHandler"
-        assert GeminiEventHandler.__name__ == "GeminiEventHandler"
-
-    def test_import_extract_functions(self) -> None:
-        from toklog.adapters import (
-            openai_extract,
-            anthropic_extract,
-            gemini_extract,
-        )
-        assert callable(openai_extract)
-        assert callable(anthropic_extract)
-        assert callable(gemini_extract)
-
 
 # ===========================================================================
 # 4. server.py _extract_non_streaming: stop_reason should come from adapter

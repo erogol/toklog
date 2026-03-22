@@ -13,9 +13,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 from toklog.context_drivers import aggregate_context_drivers
-from toklog.detectors import DetectorResult, run_all
+from toklog.detectors import run_all
 from toklog.logger import _is_benchmark_entry, read_logs
-from toklog.pricing import _normalize_model_name, compute_cost_components, get_price
+from toklog.pricing import _normalize_model_name, compute_cost_components
 
 _PERIOD_LABELS: Dict[str, str] = {
     "1d": "Last 1 Day",

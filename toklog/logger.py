@@ -6,7 +6,7 @@ import json
 import os
 import queue
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -128,41 +128,3 @@ def read_logs(
     return entries
 
 
-def cleanup_old_logs(retention_days: int | None = None) -> int:
-    """Delete logs older than retention_days.
-    
-    If retention_days is None, loads from config file.
-    
-    Args:
-        retention_days: Number of days to keep. If None, uses config default (30).
-        
-    Returns:
-        Number of files deleted.
-    """
-    if retention_days is None:
-        try:
-            from toklog.config import load_config
-            config = load_config(validate=False)
-            retention_days = config.get("logging", {}).get("retention_days", 30)
-        except Exception:
-            retention_days = 30
-
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=retention_days)
-    log_dir = Path(_LOG_DIR)
-    deleted = 0
-
-    if not log_dir.exists():
-        return deleted
-
-    for log_file in log_dir.glob("*.jsonl"):
-        try:
-            file_date = datetime.strptime(log_file.stem, "%Y-%m-%d").replace(
-                tzinfo=timezone.utc
-            )
-            if file_date < cutoff_date:
-                log_file.unlink()
-                deleted += 1
-        except (ValueError, OSError):
-            continue
-
-    return deleted

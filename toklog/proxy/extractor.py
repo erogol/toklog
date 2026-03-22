@@ -8,7 +8,16 @@ import re
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
-from toklog.wrapper import _key_hint
+
+
+def _key_hint(api_key: Any) -> Optional[str]:
+    """Return a safe identifier for an API key: last 8 chars prefixed with '...'."""
+    if not api_key or not isinstance(api_key, str):
+        return None
+    key = api_key.strip()
+    if len(key) < 4:
+        return None
+    return "..." + key[-8:]
 
 
 # Known prefixes for static (non-rotating) LLM API keys
