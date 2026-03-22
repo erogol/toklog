@@ -1,6 +1,6 @@
 # TokLog
 
-[![CI](https://github.com/erogol/toklog/actions/workflows/ci.yml/badge.svg)](https://github.com/erogol/toklog/actions/workflows/ci.yml)
+[![CI](https://github.com/erogol/toklog/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/erogol/toklog/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/toklog)](https://pypi.org/project/toklog/)
 [![License: TBFUL](https://img.shields.io/badge/license-TBFUL--1.0-blue)](LICENSE)
 
