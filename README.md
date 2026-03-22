@@ -60,4 +60,4 @@ tl doctor
 
 ## License
 
-MIT
+[TBFUL-1.0](LICENSE) — free for non-commercial and small-scale use. Commercial license required above $10k annual LLM spend.
