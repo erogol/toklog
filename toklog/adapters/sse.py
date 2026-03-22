@@ -1,3 +1,4 @@
+from __future__ import annotations
 # toklog/adapters/sse.py
 
 import json
