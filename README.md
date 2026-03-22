@@ -1,5 +1,9 @@
 # TokLog
 
+[![CI](https://github.com/erogol/toklog/actions/workflows/ci.yml/badge.svg)](https://github.com/erogol/toklog/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/toklog)](https://pypi.org/project/toklog/)
+[![License: TBFUL](https://img.shields.io/badge/license-TBFUL--1.0-blue)](LICENSE)
+
 > `htop` for your LLM spend — proxy-only.
 
 TokLog is a local-first HTTP proxy for LLM spend visibility and control.
@@ -18,8 +22,8 @@ Route OpenAI-, Anthropic-, and Gemini-compatible traffic through a local proxy. 
 
 ```bash
 pip install toklog
-toklog proxy setup
-toklog proxy start --background
+tl proxy setup
+tl proxy start --background
 ```
 
 After setup, clients that support base URL overrides can route through TokLog with no app-specific SDK integration.
@@ -41,15 +45,15 @@ After setup, clients that support base URL overrides can route through TokLog wi
 ## Core commands
 
 ```bash
-toklog proxy setup
-toklog proxy start --background
-toklog proxy status
-toklog proxy stop
+tl proxy setup
+tl proxy start --background
+tl proxy status
+tl proxy stop
 
-toklog report
-toklog gain
-toklog share --open
-toklog doctor
+tl report
+tl gain
+tl share --open
+tl doctor
 ```
 
 ---

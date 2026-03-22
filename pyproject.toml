@@ -8,12 +8,13 @@ version = "0.2.0"
 description = "Local-first proxy for LLM spend visibility and control."
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = {text = "TBFUL-1.0"}
+authors = [{name = "Eren Gölge", email = "kechetheagi@gmail.com"}]
 keywords = ["llm", "proxy", "tokens", "cost", "observability"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
@@ -27,6 +28,11 @@ dependencies = [
 [project.optional-dependencies]
 share = ["jinja2>=3.0"]
 dev = ["pytest", "pytest-cov", "pytest-asyncio", "jinja2>=3.0"]
+
+[project.urls]
+Homepage = "https://github.com/erogol/toklog"
+Repository = "https://github.com/erogol/toklog"
+Issues = "https://github.com/erogol/toklog/issues"
 
 [project.scripts]
 tl = "toklog.cli:cli"
