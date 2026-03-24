@@ -13,10 +13,6 @@ Route OpenAI-, Anthropic-, and Gemini-compatible traffic through a local proxy. 
 
 **No hosted backend. No account. No prompt egress by default.**
 
-<p align="center">
-  <img src="assets/report-screenshot.png" alt="tl report --last 7d" width="700">
-</p>
-
 ---
 
 ## Install
@@ -45,16 +41,78 @@ After setup, clients that support base URL overrides can route through TokLog wi
 
 ## Core commands
 
-```bash
-tl proxy setup
-tl proxy start --background
-tl proxy status
-tl proxy stop
+### `tl report`
 
-tl report
+Full spend breakdown — models, processes, context composition, waste detectors.
+
+```bash
+tl report           # last 7 days
+tl report --last 30d
+```
+
+<p align="center">
+  <img src="assets/report-screenshot.png" alt="tl report" width="700">
+</p>
+
+### `tl gain`
+
+Cumulative savings opportunities — shows how much waste each detector has found since install.
+
+```bash
 tl gain
-tl share --open
+```
+
+<p align="center">
+  <img src="assets/gain-screenshot.png" alt="tl gain" width="700">
+</p>
+
+### `tl doctor`
+
+Health check — verifies config, proxy, env vars, logging, and traffic.
+
+```bash
 tl doctor
+```
+
+<p align="center">
+  <img src="assets/doctor-screenshot.png" alt="tl doctor" width="700">
+</p>
+
+### `tl share`
+
+Generate a self-contained HTML report you can share — no server needed.
+
+```bash
+tl share             # save to ~/.toklog/reports/
+tl share --open      # save and open in browser
+```
+
+<p align="center">
+  <img src="assets/share-screenshot.png" alt="tl share" width="700">
+</p>
+
+### `tl proxy status`
+
+Check if the proxy daemon is running and where it's listening.
+
+```bash
+tl proxy status
+```
+
+<p align="center">
+  <img src="assets/proxy-status-screenshot.png" alt="tl proxy status" width="700">
+</p>
+
+### Other commands
+
+```bash
+tl proxy setup          # interactive setup wizard
+tl proxy start --background
+tl proxy stop
+tl tail                 # live stream of logged calls
+tl categories           # list detected call categories
+tl pricing              # show model pricing table
+tl reset                # clear all logs and config
 ```
 
 ---
