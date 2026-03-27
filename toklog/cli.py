@@ -329,12 +329,45 @@ def reset() -> None:
     click.echo(f"Deleted {len(files)} file(s). Log data has been reset.")
 
 
+def _format_tail_line(entry: dict, show_cost: bool) -> str:
+    """Format a single JSONL log entry for tail display (Rich status markup excluded).
+
+    Returns a string like:
+        claude-haiku-3-5 in=1000 out=200 $0.0016 500ms myapp
+        claude-haiku-3-5 in=1000 out=200 500ms myapp   (show_cost=False)
+    """
+    model = entry.get("model", "?")
+    tokens_in = entry.get("input_tokens") or 0
+    tokens_out = entry.get("output_tokens") or 0
+    dur = entry.get("duration_ms") or 0
+    raw_tags = entry.get("tags")
+    tag = " ".join(raw_tags) if isinstance(raw_tags, list) else (str(raw_tags) if raw_tags else "")
+
+    parts: list[str] = [f"in={tokens_in}", f"out={tokens_out}"]
+
+    if show_cost:
+        from toklog.pricing import compute_cost_components
+        components = compute_cost_components(
+            provider=entry.get("provider", ""),
+            model=model,
+            input_tokens=tokens_in,
+            output_tokens=tokens_out,
+            cache_read=entry.get("cache_read_tokens") or 0,
+            cache_creation=entry.get("cache_creation_tokens") or 0,
+        )
+        parts.append(f"${sum(components.values()):.4f}")
+
+    parts.append(f"{dur}ms")
+    if tag:
+        parts.append(tag)
+
+    return f"{model} " + " ".join(parts)
+
+
 @cli.command()
 @click.option("--cost", "show_cost", is_flag=True, default=False, help="Show cost per request.")
 def tail(show_cost: bool) -> None:
     """Live tail of today's JSONL log file."""
-    from datetime import datetime, timezone
-
     console = Console()
     log_dir = get_log_dir()
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -364,31 +397,9 @@ def tail(show_cost: bool) -> None:
                         if line:
                             try:
                                 entry = json.loads(line)
-                                model = entry.get("model", "?")
-                                tokens_in = entry.get("input_tokens") or 0
-                                tokens_out = entry.get("output_tokens") or 0
-                                dur = entry.get("duration_ms") or 0
                                 err = entry.get("error", False)
-                                tag = entry.get("tags") or ""
                                 status = "[red]ERR[/red]" if err else "[green]OK[/green]"
-                                if show_cost:
-                                    from toklog.pricing import compute_cost_components
-                                    components = compute_cost_components(
-                                        provider=entry.get("provider", ""),
-                                        model=model,
-                                        input_tokens=tokens_in,
-                                        output_tokens=tokens_out,
-                                        cache_read=entry.get("cache_read_tokens") or 0,
-                                        cache_creation=entry.get("cache_creation_tokens") or 0,
-                                    )
-                                    cost_str = f"${sum(components.values()):.4f} " if components else "$? "
-                                else:
-                                    cost_str = ""
-                                console.print(
-                                    f"{status} {model} "
-                                    f"in={tokens_in} out={tokens_out} "
-                                    f"{cost_str}{dur}ms {tag}"
-                                )
+                                console.print(f"{status} {_format_tail_line(entry, show_cost)}")
                             except json.JSONDecodeError:
                                 console.print(f"[dim]{line}[/dim]")
                     pos = f.tell()
