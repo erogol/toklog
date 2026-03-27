@@ -330,7 +330,8 @@ def reset() -> None:
 
 
 @cli.command()
-def tail() -> None:
+@click.option("--cost", "show_cost", is_flag=True, default=False, help="Show cost per request.")
+def tail(show_cost: bool) -> None:
     """Live tail of today's JSONL log file."""
     from datetime import datetime, timezone
 
@@ -370,10 +371,23 @@ def tail() -> None:
                                 err = entry.get("error", False)
                                 tag = entry.get("tags") or ""
                                 status = "[red]ERR[/red]" if err else "[green]OK[/green]"
+                                if show_cost:
+                                    from toklog.pricing import compute_cost_components
+                                    components = compute_cost_components(
+                                        provider=entry.get("provider", ""),
+                                        model=model,
+                                        input_tokens=tokens_in,
+                                        output_tokens=tokens_out,
+                                        cache_read=entry.get("cache_read_tokens") or 0,
+                                        cache_creation=entry.get("cache_creation_tokens") or 0,
+                                    )
+                                    cost_str = f"${sum(components.values()):.4f} " if components else "$? "
+                                else:
+                                    cost_str = ""
                                 console.print(
                                     f"{status} {model} "
                                     f"in={tokens_in} out={tokens_out} "
-                                    f"{dur}ms {tag}"
+                                    f"{cost_str}{dur}ms {tag}"
                                 )
                             except json.JSONDecodeError:
                                 console.print(f"[dim]{line}[/dim]")
