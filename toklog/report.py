@@ -16,6 +16,7 @@ from toklog.context_drivers import aggregate_context_drivers
 from toklog.detectors import run_all
 from toklog.logger import _is_benchmark_entry, read_logs
 from toklog.pricing import _normalize_model_name, compute_cost_components
+from toklog.proxy.budget import load_status_from_file
 
 _PERIOD_LABELS: Dict[str, str] = {
     "1d": "Last 1 Day",
@@ -147,6 +148,7 @@ def generate_report(
 
     # Compute aggregates
     total_calls = len(entries)
+    budget_rejections = sum(1 for e in entries if e.get("budget_rejected") is True)
     total_spend = sum(_compute_cost(e) for e in entries)
     total_waste = sum(d.estimated_waste_usd for d in detector_results if d.triggered)
 
@@ -328,6 +330,8 @@ def generate_report(
         "error_calls": error_calls,
         "error_wasted_usd": error_wasted_usd,
         "errors_by_type": errors_by_type,
+        "budget_rejections": budget_rejections,
+        "budget": load_status_from_file(),
     }
 
 
@@ -376,6 +380,33 @@ def render_text(report: Dict[str, Any], console: Optional[Console] = None) -> No
         f"{error_rate_str}"
     )
     console.print(Panel(summary, title=f"TokLog Report – {period_label}"))
+
+    # Budget bar — only when enforcement is active
+    budget = report.get("budget")
+    if budget is not None and budget.get("enforcing"):
+        limit = budget.get("limit_usd", 0)
+        spent = budget.get("daily_spend", 0)
+        pct = (spent / limit * 100) if limit > 0 else 0
+        filled = int(round(pct / 10))
+        filled = min(filled, 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        if pct > 90:
+            color = "red"
+        elif pct >= 75:
+            color = "yellow"
+        else:
+            color = "green"
+        console.print(
+            f"[{color}]Budget: ${spent:.2f} / ${limit:.2f} {bar} {pct:.0f}%[/{color}]"
+        )
+
+    # Rejection warning
+    budget_rejections = report.get("budget_rejections", 0)
+    if budget_rejections > 0:
+        console.print(
+            f"[bold yellow]⚠ {budget_rejections} request{'s' if budget_rejections != 1 else ''}"
+            f" {'were' if budget_rejections != 1 else 'was'} blocked by budget enforcement during this period.[/bold yellow]"
+        )
 
     trend = report.get("spend_trend")
     if trend is not None:

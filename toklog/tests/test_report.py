@@ -911,3 +911,207 @@ class TestPruneNegligibleKeys:
         render_text(report, console=console)
         output = buf.getvalue()
         assert "1 more key " in output  # singular, note trailing space to avoid matching "keys"
+
+
+class TestBudgetReport:
+    """Budget bar and rejection warnings in reports."""
+
+    def test_generate_report_counts_budget_rejections(self, tmp_path: Path) -> None:
+        """budget_rejections counts entries with budget_rejected: true."""
+        log_entry(_sample_entry())
+        log_entry(_sample_entry(budget_rejected=True))
+        log_entry(_sample_entry(budget_rejected=True))
+        log_entry(_sample_entry(budget_rejected=False))
+        with patch("toklog.report.load_status_from_file", return_value=None):
+            report = generate_report(last="all")
+        assert report["budget_rejections"] == 2
+
+    def test_generate_report_includes_budget_from_state_file(self, tmp_path: Path) -> None:
+        """budget key comes from load_status_from_file()."""
+        log_entry(_sample_entry())
+        budget_state = {
+            "limit_usd": 10.0,
+            "daily_spend": 7.42,
+            "remaining": 2.58,
+            "rejected_count": 0,
+            "date": "2025-03-09",
+            "enforcing": True,
+        }
+        with patch("toklog.report.load_status_from_file", return_value=budget_state):
+            report = generate_report(last="all")
+        assert report["budget"] == budget_state
+
+    def test_generate_report_budget_none_when_no_state_file(self, tmp_path: Path) -> None:
+        """budget is None when state file doesn't exist."""
+        log_entry(_sample_entry())
+        with patch("toklog.report.load_status_from_file", return_value=None):
+            report = generate_report(last="all")
+        assert report["budget"] is None
+
+    def test_render_text_shows_budget_bar_when_enforcing(self, tmp_path: Path) -> None:
+        """Budget bar appears when enforcement is active."""
+        from rich.console import Console as RichConsole
+
+        log_entry(_sample_entry())
+        budget_state = {
+            "limit_usd": 10.0,
+            "daily_spend": 7.42,
+            "remaining": 2.58,
+            "rejected_count": 0,
+            "date": "2025-03-09",
+            "enforcing": True,
+        }
+        with patch("toklog.report.load_status_from_file", return_value=budget_state):
+            report = generate_report(last="all")
+        buf = StringIO()
+        console = RichConsole(file=buf, no_color=True, width=120)
+        render_text(report, console=console)
+        output = buf.getvalue()
+        assert "Budget:" in output
+        assert "$7.42" in output
+        assert "$10.00" in output
+        assert "74%" in output
+
+    def test_render_text_shows_rejection_warning(self, tmp_path: Path) -> None:
+        """Rejection warning appears when budget_rejections > 0."""
+        from rich.console import Console as RichConsole
+
+        log_entry(_sample_entry(budget_rejected=True))
+        log_entry(_sample_entry(budget_rejected=True))
+        log_entry(_sample_entry())
+        with patch("toklog.report.load_status_from_file", return_value=None):
+            report = generate_report(last="all")
+        buf = StringIO()
+        console = RichConsole(file=buf, no_color=True, width=120)
+        render_text(report, console=console)
+        output = buf.getvalue()
+        assert "2 requests were blocked by budget enforcement" in output
+
+    def test_render_text_omits_budget_bar_when_no_budget(self, tmp_path: Path) -> None:
+        """Budget bar does not appear when no budget is configured."""
+        from rich.console import Console as RichConsole
+
+        log_entry(_sample_entry())
+        with patch("toklog.report.load_status_from_file", return_value=None):
+            report = generate_report(last="all")
+        buf = StringIO()
+        console = RichConsole(file=buf, no_color=True, width=120)
+        render_text(report, console=console)
+        output = buf.getvalue()
+        assert "Budget:" not in output
+
+    def test_budget_bar_color_green_under_75(self, tmp_path: Path) -> None:
+        """Budget bar uses green markup when under 75%."""
+        from rich.console import Console as RichConsole
+
+        log_entry(_sample_entry())
+        budget_state = {
+            "limit_usd": 10.0,
+            "daily_spend": 5.0,
+            "remaining": 5.0,
+            "rejected_count": 0,
+            "date": "2025-03-09",
+            "enforcing": True,
+        }
+        with patch("toklog.report.load_status_from_file", return_value=budget_state):
+            report = generate_report(last="all")
+        buf = StringIO()
+        console = RichConsole(file=buf, no_color=True, width=120)
+        render_text(report, console=console)
+        output = buf.getvalue()
+        assert "Budget:" in output
+        assert "$5.00" in output
+        assert "$10.00" in output
+        # 50% — green range (under 75%)
+        assert "50%" in output
+
+    def test_budget_bar_color_yellow_75_to_90(self, tmp_path: Path) -> None:
+        """Budget bar uses yellow markup when 75-90%."""
+        from rich.console import Console as RichConsole
+
+        log_entry(_sample_entry())
+        budget_state = {
+            "limit_usd": 10.0,
+            "daily_spend": 8.0,
+            "remaining": 2.0,
+            "rejected_count": 0,
+            "date": "2025-03-09",
+            "enforcing": True,
+        }
+        with patch("toklog.report.load_status_from_file", return_value=budget_state):
+            report = generate_report(last="all")
+        buf = StringIO()
+        console = RichConsole(file=buf, no_color=True, width=120)
+        render_text(report, console=console)
+        output = buf.getvalue()
+        assert "Budget:" in output
+        assert "$8.00" in output
+        assert "80%" in output
+
+    def test_budget_bar_color_red_over_90(self, tmp_path: Path) -> None:
+        """Budget bar uses red markup when over 90%."""
+        from rich.console import Console as RichConsole
+
+        log_entry(_sample_entry())
+        budget_state = {
+            "limit_usd": 10.0,
+            "daily_spend": 9.5,
+            "remaining": 0.5,
+            "rejected_count": 0,
+            "date": "2025-03-09",
+            "enforcing": True,
+        }
+        with patch("toklog.report.load_status_from_file", return_value=budget_state):
+            report = generate_report(last="all")
+        buf = StringIO()
+        console = RichConsole(file=buf, no_color=True, width=120)
+        render_text(report, console=console)
+        output = buf.getvalue()
+        assert "Budget:" in output
+        assert "$9.50" in output
+        assert "95%" in output
+
+    def test_budget_bar_color_markup_thresholds(self) -> None:
+        """Verify correct Rich color markup is chosen at each threshold."""
+        from rich.console import Console as RichConsole
+
+        # Build a minimal report dict by hand
+        base_report: Dict[str, Any] = {
+            "period": "1d",
+            "total_calls": 1,
+            "total_spend_usd": 1.0,
+            "estimated_waste_usd": 0.0,
+            "waste_pct": 0.0,
+            "detectors": [],
+            "cost_by_model": {},
+            "cost_by_process": [],
+            "cost_by_key": [],
+            "pruned_keys_summary": None,
+            "cost_by_call_site": [],
+            "cost_by_context_driver": [],
+            "spend_trend": None,
+            "error_calls": 0,
+            "error_wasted_usd": 0.0,
+            "errors_by_type": [],
+            "budget_rejections": 0,
+        }
+
+        for spend, expected_color in [(5.0, "green"), (7.5, "yellow"), (9.5, "red")]:
+            report = dict(base_report)
+            report["budget"] = {
+                "limit_usd": 10.0,
+                "daily_spend": spend,
+                "remaining": 10.0 - spend,
+                "rejected_count": 0,
+                "date": "2025-03-09",
+                "enforcing": True,
+            }
+            buf = StringIO()
+            console = RichConsole(file=buf, no_color=False, force_terminal=True, width=120)
+            render_text(report, console=console)
+            output = buf.getvalue()
+            # Verify the ANSI color code is present: green=32, yellow=33, red=31
+            ansi_codes = {"green": "\x1b[32m", "yellow": "\x1b[33m", "red": "\x1b[31m"}
+            assert ansi_codes[expected_color] in output, (
+                f"Expected {expected_color} ANSI code for spend=${spend}, got: {output[:200]}"
+            )
