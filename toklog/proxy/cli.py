@@ -14,7 +14,8 @@ def proxy_cli() -> None:
 @proxy_cli.command("start")
 @click.option("--port", default=4007, show_default=True, help="Port to listen on.")
 @click.option("--background", is_flag=True, help="Fork into background.")
-def proxy_start(port: int, background: bool) -> None:
+@click.option("--budget", default=None, type=float, help="Daily spend limit in USD.")
+def proxy_start(port: int, background: bool, budget: float | None) -> None:
     """Start the TokLog HTTP proxy."""
     from toklog.proxy.daemon import start, status
 
@@ -37,8 +38,11 @@ def proxy_start(port: int, background: bool) -> None:
         log_path = Path.home() / ".toklog" / "proxy.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fd = open(log_path, "a")  # noqa: SIM115 — file left open intentionally for child
+        cmd = [sys.executable, "-m", "toklog.proxy.daemon", "--port", str(port)]
+        if budget is not None:
+            cmd.extend(["--budget", str(budget)])
         subprocess.Popen(
-            [sys.executable, "-m", "toklog.proxy.daemon", "--port", str(port)],
+            cmd,
             env={**os.environ, "TOKLOG_PROXY_PORT": str(port)},
             start_new_session=True,
             stdout=log_fd,
@@ -51,11 +55,13 @@ def proxy_start(port: int, background: bool) -> None:
             if _PID_FILE.exists():
                 break
             _time.sleep(0.1)
-        Console().print(f"[green]Proxy started in background on port {port}.[/green]")
+        budget_msg = f" (budget: ${budget:.2f}/day)" if budget is not None else ""
+        Console().print(f"[green]Proxy started in background on port {port}{budget_msg}.[/green]")
         Console().print(f"  Logs: {log_path}")
     else:
-        Console().print(f"[green]Starting TokLog proxy on 127.0.0.1:{port}...[/green]")
-        start(port=port)
+        budget_msg = f" (budget: ${budget:.2f}/day)" if budget is not None else ""
+        Console().print(f"[green]Starting TokLog proxy on 127.0.0.1:{port}{budget_msg}...[/green]")
+        start(port=port, budget_usd=budget)
 
 
 @proxy_cli.command("stop")
@@ -81,6 +87,15 @@ def proxy_status() -> None:
         console.print(f"[green]● Proxy running[/green] — PID {st['pid']}, port {port}")
         console.print(f"  OPENAI_BASE_URL=http://127.0.0.1:{port}/openai")
         console.print(f"  ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic")
+
+        from toklog.proxy.budget import load_status_from_file
+
+        budget_state = load_status_from_file()
+        if budget_state and budget_state.get("enforcing"):
+            spent = budget_state["daily_spend"]
+            limit = budget_state["limit_usd"]
+            pct = (spent / limit * 100) if limit > 0 else 0
+            console.print(f"  Budget: ${spent:.2f} / ${limit:.2f} ({pct:.0f}%)")
     else:
         console.print("[red]● Proxy not running[/red]")
         console.print("  Run: toklog proxy start --background")

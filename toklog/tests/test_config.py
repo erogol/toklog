@@ -17,6 +17,15 @@ from toklog.config import (
 )
 
 
+class TestDefaults:
+    """Tests for _DEFAULTS structure."""
+
+    def test_proxy_budget_usd_in_defaults(self):
+        """proxy.budget_usd exists in defaults and is None."""
+        assert "budget_usd" in _DEFAULTS["proxy"]
+        assert _DEFAULTS["proxy"]["budget_usd"] is None
+
+
 class TestLoadConfig:
     """Tests for load_config function."""
 
@@ -26,8 +35,21 @@ class TestLoadConfig:
             config_path = Path(tmpdir) / "config.json"
             config = load_config(config_path=config_path, validate=False)
             assert config["proxy"]["port"] == 4007
+            assert config["proxy"]["budget_usd"] is None
             assert config["logging"]["retention_days"] == 30
             assert config["skip_processes"] == []
+
+    def test_load_config_budget_usd_from_file(self):
+        """budget_usd can be set from config file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            file_config = {"proxy": {"budget_usd": 15.0}}
+            config_path.write_text(json.dumps(file_config))
+
+            config = load_config(config_path=config_path, validate=False)
+            assert config["proxy"]["budget_usd"] == 15.0
+            # Other defaults preserved
+            assert config["proxy"]["port"] == 4007
 
     def test_load_config_from_file(self):
         """Load values from file, merge with defaults."""

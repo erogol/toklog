@@ -14,6 +14,7 @@ _DEFAULTS: Dict[str, Any] = {
         "port": 4007,
         "host": "127.0.0.1",
         "enabled": True,
+        "budget_usd": None,  # daily spend limit in USD, None = no enforcement
     },
     "logging": {
         "retention_days": 30,

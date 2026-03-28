@@ -11,7 +11,7 @@ DEFAULT_PORT = int(os.environ.get("TOKLOG_PROXY_PORT", "4007"))
 DEFAULT_HOST = "127.0.0.1"
 
 
-def start(port: int = DEFAULT_PORT, host: str = DEFAULT_HOST) -> None:
+def start(port: int = DEFAULT_PORT, host: str = DEFAULT_HOST, budget_usd: float | None = None) -> None:
     """Start the proxy in the foreground. Called by launchd/systemd or background fork."""
     import uvicorn
 
@@ -29,6 +29,12 @@ def start(port: int = DEFAULT_PORT, host: str = DEFAULT_HOST) -> None:
     # CLI args override config file
     final_port = port if port != DEFAULT_PORT else config_port
     final_host = host if host != DEFAULT_HOST else config_host
+
+    # Resolve budget: CLI arg > config file > None (no enforcement)
+    final_budget = budget_usd if budget_usd is not None else config.get("proxy", {}).get("budget_usd")
+
+    from toklog.proxy import budget as budget_mod
+    budget_mod.configure(limit_usd=final_budget)
 
     _PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     _PID_FILE.write_text(str(os.getpid()))
@@ -71,5 +77,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TokLog proxy daemon")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--budget", type=float, default=None, help="Daily budget in USD")
     args = parser.parse_args()
-    start(port=args.port, host=args.host)
+    start(port=args.port, host=args.host, budget_usd=args.budget)
