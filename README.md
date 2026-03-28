@@ -117,6 +117,58 @@ tl reset                # clear all logs and config
 
 ---
 
+## Budget Kill Switch
+
+Set a daily spend limit. When the budget is exceeded, the proxy returns `HTTP 429` immediately — no upstream request is made.
+
+### Enable it
+
+CLI flag (takes precedence over config):
+
+```bash
+tl proxy start --budget 10.00
+```
+
+Or set it in `~/.toklog/config.json`:
+
+```json
+{
+  "proxy": {
+    "budget_usd": 10.00
+  }
+}
+```
+
+### What happens at the limit
+
+Requests get a `429 Too Many Requests` response with a JSON error body:
+
+```json
+{
+  "error": {
+    "message": "Daily budget of $10.00 exceeded",
+    "type": "budget_exceeded"
+  }
+}
+```
+
+No tokens are consumed. No upstream contact is made.
+
+### Monitoring
+
+```bash
+tl proxy status   # shows current spend vs budget limit
+tl report         # includes budget bar and rejection warnings
+```
+
+### Behavior notes
+
+- Resets at midnight local time
+- No budget configured = no enforcement (fully backward compatible)
+- GET requests (e.g. `/v1/models`) are never blocked
+
+---
+
 ## License
 
 [TBFUL-1.0](LICENSE) — free for non-commercial and small-scale use. Commercial license required above $10k annual LLM spend.
