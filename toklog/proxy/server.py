@@ -269,7 +269,8 @@ async def proxy_handler(request: Request) -> Response:
     provider, remainder = parts[0], parts[1]
 
     # Budget enforcement — reject before body read or upstream contact
-    allowed, budget_info = budget_mod.check()
+    # Only check POST requests (GET /models, etc. are free and shouldn't be blocked)
+    allowed, budget_info = (True, {}) if request.method != "POST" else budget_mod.check()
     if not allowed:
         rejection_entry = {
             "timestamp": time.time(),

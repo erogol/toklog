@@ -1368,17 +1368,16 @@ def test_openai_v1_responses_dedup():
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _reset_budget():
-    """Reset budget tracker between tests so budget state doesn't leak."""
-    import toklog.proxy.budget as budget_mod
-    budget_mod.configure(limit_usd=None)
-    yield
-    budget_mod.configure(limit_usd=None)
-
-
 class TestBudgetEnforcement:
     """Tests for budget check (429 rejection) and cost recording."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_budget(self):
+        """Reset budget tracker between tests so budget state doesn't leak."""
+        import toklog.proxy.budget as budget_mod
+        budget_mod.configure(limit_usd=None)
+        yield
+        budget_mod.configure(limit_usd=None)
 
     def test_budget_exceeded_returns_429(self, tmp_path):
         """When budget is exceeded, proxy returns 429 without forwarding upstream."""
@@ -1534,3 +1533,47 @@ class TestBudgetEnforcement:
         assert resp.status_code == 429
         body = resp.json()
         assert body["error"]["type"] == "budget_exceeded"
+
+    def test_get_request_not_blocked_by_budget(self, tmp_path):
+        """GET requests (e.g. /openai/models) pass through even when over budget."""
+        import toklog.proxy.budget as budget_mod
+
+        budget_mod.configure(limit_usd=0.01, state_path=tmp_path / "state.json")
+        budget_mod.record(1.0)  # over budget
+
+        fake_resp = _FakeResponse(
+            200, json.dumps({"data": [{"id": "gpt-4o"}]}).encode()
+        )
+        fake_client = _FakeSendClient(fake_resp)
+
+        with patch("toklog.proxy.server._get_client", return_value=fake_client), \
+             patch("toklog.proxy.server.log_entry"):
+            tc = TestClient(app)
+            resp = tc.get(
+                "/openai/models",
+                headers={"Authorization": "Bearer sk-test"},
+            )
+
+        assert resp.status_code == 200, "GET request was blocked by budget"
+
+    def test_error_response_does_not_crash_budget(self, tmp_path):
+        """4xx upstream responses don't crash the budget recording code path."""
+        import toklog.proxy.budget as budget_mod
+
+        budget_mod.configure(limit_usd=100.0, state_path=tmp_path / "state.json")
+
+        fake_resp = _FakeResponse(400, json.dumps({"error": {"message": "bad"}}).encode())
+        fake_client = _FakeSendClient(fake_resp)
+
+        with patch("toklog.proxy.server._get_client", return_value=fake_client), \
+             patch("toklog.proxy.server.log_entry"):
+            tc = TestClient(app)
+            resp = tc.post(
+                "/openai/chat/completions",
+                json={"model": "gpt-4o", "messages": []},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+
+        assert resp.status_code == 400
+        s = budget_mod.status()
+        assert isinstance(s["daily_spend"], float)  # didn't crash

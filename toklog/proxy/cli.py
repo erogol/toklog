@@ -95,7 +95,8 @@ def proxy_status() -> None:
             spent = budget_state["daily_spend"]
             limit = budget_state["limit_usd"]
             pct = (spent / limit * 100) if limit > 0 else 0
-            console.print(f"  Budget: ${spent:.2f} / ${limit:.2f} ({pct:.0f}%)")
+            fmt = lambda v: f"${v:.4f}" if 0 < v < 0.01 else f"${v:.2f}"
+            console.print(f"  Budget: {fmt(spent)} / {fmt(limit)} ({pct:.0f}%)")
     else:
         console.print("[red]● Proxy not running[/red]")
         console.print("  Run: toklog proxy start --background")

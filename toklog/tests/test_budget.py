@@ -29,6 +29,28 @@ def tmp_state(tmp_path):
 # BudgetTracker — no limit
 # ------------------------------------------------------------------
 
+class TestValidation:
+    def test_negative_limit_raises(self, tmp_state):
+        with pytest.raises(ValueError, match="positive"):
+            BudgetTracker(limit_usd=-5.0, state_path=tmp_state)
+
+    def test_zero_limit_raises(self, tmp_state):
+        with pytest.raises(ValueError, match="positive"):
+            BudgetTracker(limit_usd=0.0, state_path=tmp_state)
+
+    def test_string_limit_raises(self, tmp_state):
+        with pytest.raises(ValueError, match="positive number or None"):
+            BudgetTracker(limit_usd="ten", state_path=tmp_state)
+
+    def test_none_limit_is_valid(self, tmp_state):
+        t = BudgetTracker(limit_usd=None, state_path=tmp_state)
+        assert t.status()["limit_usd"] is None
+
+
+# ------------------------------------------------------------------
+# BudgetTracker — no limit
+# ------------------------------------------------------------------
+
 class TestNoLimit:
     def test_check_always_allows(self, tmp_state):
         t = BudgetTracker(limit_usd=None, state_path=tmp_state)
@@ -211,6 +233,22 @@ class TestStateFile:
         t = BudgetTracker(limit_usd=5.0, state_path=deep_path)
         t.record(1.0)
         assert deep_path.exists()
+
+    def test_load_status_stale_date_resets(self, tmp_state):
+        """State file from yesterday should show zeroed counters."""
+        t = BudgetTracker(limit_usd=10.0, state_path=tmp_state)
+        t.record(7.0)
+        t.check()  # still under budget, no rejection
+
+        # Manually set the date to yesterday in the file
+        data = json.loads(tmp_state.read_text())
+        data["date"] = "2020-01-01"
+        tmp_state.write_text(json.dumps(data))
+
+        loaded = load_status_from_file(tmp_state)
+        assert loaded["daily_spend"] == 0.0
+        assert loaded["rejected_count"] == 0
+        assert loaded["remaining"] == 10.0
 
 
 # ------------------------------------------------------------------

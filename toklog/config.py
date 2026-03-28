@@ -109,6 +109,14 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     if not all(isinstance(v, bool) for v in features.values()):
         raise ValueError("All feature flags must be boolean")
 
+    # Check budget_usd
+    budget = proxy.get("budget_usd")
+    if budget is not None:
+        if not isinstance(budget, (int, float)):
+            raise ValueError("proxy.budget_usd must be a number or null")
+        if budget <= 0:
+            raise ValueError(f"proxy.budget_usd must be positive, got {budget}")
+
 
 def create_config_interactive(
     port_override: int | None = None,

@@ -6,6 +6,11 @@ without forwarding upstream.
 
 State is persisted to ~/.toklog/budget_state.json on every mutation so
 other processes (tl proxy status, tl report) can read it.
+
+Note: requests opted out of logging (X-TB-Skip, no-log, skip_processes,
+TOKLOG_SKIP_MODELS) are NOT counted toward the budget since their usage
+is not extracted.  The budget tracks the same requests that appear in
+``tl report``.
 """
 
 from __future__ import annotations
@@ -32,6 +37,9 @@ class BudgetTracker:
     """In-memory daily spend tracker with optional hard limit."""
 
     def __init__(self, limit_usd: float | None = None, state_path: Path | None = None):
+        if limit_usd is not None:
+            if not isinstance(limit_usd, (int, float)) or limit_usd <= 0:
+                raise ValueError(f"limit_usd must be a positive number or None, got {limit_usd!r}")
         self._limit_usd = limit_usd
         self._daily_spend: float = 0.0
         self._rejected_count: int = 0
@@ -168,10 +176,21 @@ def load_status_from_file(path: Path | None = None) -> Optional[Dict[str, Any]]:
     """Read budget state from the state file (for cross-process consumption).
 
     Returns None if the file doesn't exist or is unreadable.
+    If the state file is from a previous day, resets spend/rejected to 0
+    (the proxy would have reset on its next request, but hasn't run yet).
     """
     state_path = path or _default_state_path()
     try:
         with open(state_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+    # If state is from a previous day, show zeroed counters
+    if data.get("date") and data["date"] != _today():
+        data["daily_spend"] = 0.0
+        data["rejected_count"] = 0
+        limit = data.get("limit_usd")
+        data["remaining"] = limit if limit is not None else None
+
+    return data

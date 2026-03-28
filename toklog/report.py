@@ -397,7 +397,7 @@ def render_text(report: Dict[str, Any], console: Optional[Console] = None) -> No
         else:
             color = "green"
         console.print(
-            f"[{color}]Budget: ${spent:.2f} / ${limit:.2f} {bar} {pct:.0f}%[/{color}]"
+            f"[{color}]Budget: {_fmt_usd(spent)} / {_fmt_usd(limit)} {bar} {pct:.0f}%[/{color}]"
         )
 
     # Rejection warning
