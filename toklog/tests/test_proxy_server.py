@@ -1361,3 +1361,176 @@ def test_openai_v1_responses_dedup():
     assert captured_urls, "build_request was not called"
     assert "/v1/v1/" not in captured_urls[0], f"Double /v1 in URL: {captured_urls[0]}"
     assert "api.openai.com/v1/responses" in captured_urls[0]
+
+
+# ---------------------------------------------------------------------------
+# Budget kill switch integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_budget():
+    """Reset budget tracker between tests so budget state doesn't leak."""
+    import toklog.proxy.budget as budget_mod
+    budget_mod.configure(limit_usd=None)
+    yield
+    budget_mod.configure(limit_usd=None)
+
+
+class TestBudgetEnforcement:
+    """Tests for budget check (429 rejection) and cost recording."""
+
+    def test_budget_exceeded_returns_429(self, tmp_path):
+        """When budget is exceeded, proxy returns 429 without forwarding upstream."""
+        import toklog.proxy.budget as budget_mod
+
+        state_file = tmp_path / "budget_state.json"
+        budget_mod.configure(limit_usd=1.0, state_path=state_file)
+        budget_mod.record(2.0)  # over budget
+
+        logged: list[dict] = []
+
+        with patch("toklog.proxy.server.log_entry", side_effect=logged.append):
+            tc = TestClient(app)
+            resp = tc.post(
+                "/openai/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+
+        assert resp.status_code == 429
+        body = resp.json()
+        assert body["error"]["type"] == "budget_exceeded"
+        assert body["error"]["budget_limit"] == 1.0
+        assert body["error"]["daily_spend"] == 2.0
+        # Should log the rejection
+        assert len(logged) == 1
+        assert logged[0]["budget_rejected"] is True
+        assert logged[0]["provider"] == "openai"
+
+    def test_budget_exceeded_does_not_forward_upstream(self, tmp_path):
+        """429 budget rejection must NOT contact the upstream provider."""
+        import toklog.proxy.budget as budget_mod
+
+        budget_mod.configure(limit_usd=0.01, state_path=tmp_path / "state.json")
+        budget_mod.record(1.0)
+
+        send_called = False
+
+        class _SpyClient:
+            def build_request(self, *a, **kw):
+                return MagicMock(spec=httpx.Request)
+
+            async def send(self, *a, **kw):
+                nonlocal send_called
+                send_called = True
+                return _FakeResponse(200, b'{}')
+
+        with patch("toklog.proxy.server._get_client", return_value=_SpyClient()), \
+             patch("toklog.proxy.server.log_entry"):
+            tc = TestClient(app)
+            resp = tc.post(
+                "/anthropic/v1/messages",
+                json={"model": "claude-sonnet-4-5", "messages": []},
+                headers={"x-api-key": "sk-ant-api-test"},
+            )
+
+        assert resp.status_code == 429
+        assert not send_called, "Upstream was contacted despite budget exceeded"
+
+    def test_under_budget_forwards_normally(self, tmp_path):
+        """When under budget, requests forward normally."""
+        import toklog.proxy.budget as budget_mod
+
+        budget_mod.configure(limit_usd=100.0, state_path=tmp_path / "state.json")
+
+        fake_body = {
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"message": {"role": "assistant", "content": "Hi"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        fake_resp = _FakeResponse(200, json.dumps(fake_body).encode())
+        fake_client = _FakeSendClient(fake_resp)
+
+        with patch("toklog.proxy.server._get_client", return_value=fake_client), \
+             patch("toklog.proxy.server.log_entry"):
+            tc = TestClient(app)
+            resp = tc.post(
+                "/openai/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+
+        assert resp.status_code == 200
+
+    def test_no_budget_set_forwards_normally(self):
+        """With no budget configured, all requests pass through."""
+        fake_body = {
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"message": {"role": "assistant", "content": "Hi"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        fake_resp = _FakeResponse(200, json.dumps(fake_body).encode())
+        fake_client = _FakeSendClient(fake_resp)
+
+        with patch("toklog.proxy.server._get_client", return_value=fake_client), \
+             patch("toklog.proxy.server.log_entry"):
+            tc = TestClient(app)
+            resp = tc.post(
+                "/openai/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+
+        assert resp.status_code == 200
+
+    def test_cost_recorded_after_non_streaming_response(self, tmp_path):
+        """After a non-streaming response, cost is recorded in the budget tracker."""
+        import toklog.proxy.budget as budget_mod
+
+        state_file = tmp_path / "budget_state.json"
+        budget_mod.configure(limit_usd=100.0, state_path=state_file)
+
+        fake_body = {
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{"message": {"role": "assistant", "content": "Hi"}}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 500},
+        }
+        fake_resp = _FakeResponse(200, json.dumps(fake_body).encode())
+        fake_client = _FakeSendClient(fake_resp)
+
+        with patch("toklog.proxy.server._get_client", return_value=fake_client), \
+             patch("toklog.proxy.server.log_entry"):
+            tc = TestClient(app)
+            tc.post(
+                "/openai/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+
+        s = budget_mod.status()
+        assert s["daily_spend"] > 0, "Cost was not recorded in budget tracker"
+
+    def test_429_body_provider_agnostic(self, tmp_path):
+        """Budget 429 works for all providers (test with Gemini path)."""
+        import toklog.proxy.budget as budget_mod
+
+        budget_mod.configure(limit_usd=0.01, state_path=tmp_path / "state.json")
+        budget_mod.record(1.0)
+
+        with patch("toklog.proxy.server.log_entry"):
+            tc = TestClient(app)
+            resp = tc.post(
+                "/gemini/v1beta/models/gemini-pro:generateContent",
+                json={"contents": [{"parts": [{"text": "Hi"}]}]},
+            )
+
+        assert resp.status_code == 429
+        body = resp.json()
+        assert body["error"]["type"] == "budget_exceeded"

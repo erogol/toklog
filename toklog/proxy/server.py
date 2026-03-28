@@ -21,6 +21,8 @@ from toklog.adapters.sse import SSEStreamBuffer
 from toklog.adapters import openai as openai_adapter
 from toklog.adapters import anthropic as anthropic_adapter
 from toklog.adapters import gemini as gemini_adapter
+from toklog.pricing import compute_cost_components
+from toklog.proxy import budget as budget_mod
 from toklog.proxy.extractor import extract_from_request
 
 
@@ -241,6 +243,21 @@ def _extract_non_streaming(entry: dict, provider: str, endpoint_family: str | No
         result.apply_to_entry(entry)
 
 
+def _record_budget_cost(entry: dict) -> None:
+    """Compute cost from a log entry and record it in the budget tracker."""
+    components = compute_cost_components(
+        provider=entry.get("provider", ""),
+        model=entry.get("model", ""),
+        input_tokens=entry.get("input_tokens") or 0,
+        output_tokens=entry.get("output_tokens") or 0,
+        cache_read=entry.get("cache_read_tokens") or 0,
+        cache_creation=entry.get("cache_creation_tokens") or 0,
+    )
+    cost = sum(components.values())
+    if cost > 0:
+        budget_mod.record(cost)
+
+
 async def proxy_handler(request: Request) -> Response:
     """Route, forward, log, and return all LLM API requests."""
     # Parse provider from URL prefix: /openai/... or /anthropic/...
@@ -250,6 +267,22 @@ async def proxy_handler(request: Request) -> Response:
         return Response("Not found", status_code=404)
 
     provider, remainder = parts[0], parts[1]
+
+    # Budget enforcement — reject before body read or upstream contact
+    allowed, budget_info = budget_mod.check()
+    if not allowed:
+        rejection_entry = {
+            "timestamp": time.time(),
+            "provider": provider,
+            "budget_rejected": True,
+            "instrumentation": "proxy",
+        }
+        log_entry(rejection_entry)
+        return Response(
+            content=json.dumps({"error": budget_info}).encode(),
+            status_code=429,
+            media_type="application/json",
+        )
 
     # Strip duplicate path prefix (e.g. /openai/v1/... when upstream already has /v1)
     dedup = _UPSTREAM_PREFIX_DEDUP.get(provider)
@@ -394,6 +427,7 @@ async def proxy_handler(request: Request) -> Response:
                 if should_log:
                     entry["duration_ms"] = int((time.monotonic() - start) * 1000)
                     log_entry(entry)
+                    _record_budget_cost(entry)
 
         return StreamingResponse(
             generate(), status_code=resp.status_code, headers=resp_headers
@@ -421,6 +455,7 @@ async def proxy_handler(request: Request) -> Response:
         if endpoint_family:
             entry["endpoint_family"] = endpoint_family
         log_entry(entry)
+        _record_budget_cost(entry)
 
     return Response(
         content=content,
