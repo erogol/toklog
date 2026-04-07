@@ -660,7 +660,7 @@ class TestRunAll:
     def test_returns_nine_results(self) -> None:
         entries = [_base_entry() for _ in range(5)]
         results = run_all(entries)
-        assert len(results) == 9  # Added credential_sharing detector
+        assert len(results) == 10  # Added cost_spike detector
 
     def test_null_fields_no_crash(self) -> None:
         """Entries with null fields should not crash detectors."""
@@ -677,7 +677,7 @@ class TestRunAll:
             for _ in range(5)
         ]
         results = run_all(entries)
-        assert len(results) == 9  # Added credential_sharing detector
+        assert len(results) == 10  # Added cost_spike detector
         for r in results:
             assert isinstance(r.triggered, bool)
 
@@ -696,4 +696,5 @@ class TestRunAll:
             "model_downgrade_opportunity",
             "thinking_overhead",
             "credential_sharing",
+            "cost_spike",
         }

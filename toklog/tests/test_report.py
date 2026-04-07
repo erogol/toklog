@@ -149,7 +149,7 @@ class TestGenerateReport:
         report = generate_report(last="all")
         assert report["total_calls"] == 5
         assert report["total_spend_usd"] > 0
-        assert len(report["detectors"]) == 9  # Added credential_sharing detector
+        assert len(report["detectors"]) == 10  # Added cost_spike detector
         assert "cost_by_model" in report
 
     def test_empty_report(self, tmp_path: Path) -> None:

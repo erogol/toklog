@@ -45,6 +45,7 @@ def run_all(entries: List[Dict[str, Any]]) -> List[DetectorResult]:
         detect_model_downgrade_opportunity(entries),
         detect_thinking_overhead(entries),
         detect_credential_sharing(entries),
+        detect_cost_spike(entries),
     ]
 
 
@@ -889,4 +890,174 @@ def detect_credential_sharing(entries: List[Dict[str, Any]]) -> DetectorResult:
             else "No shared credentials detected."
         ),
         details={"shared_keys": shared_keys},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Detector 10: Cost Spike (anomaly detection)
+# ---------------------------------------------------------------------------
+
+# Minimum entries in a session (or globally) to compute meaningful stats.
+_SPIKE_MIN_SAMPLE = 5
+
+# Tukey fence multiplier for "far outlier" detection.
+# k=3 is standard for far outliers (k=1.5 for mild).
+_SPIKE_FENCE_K = 3.0
+
+# Max spike entries to include in details (keep report readable).
+_SPIKE_MAX_DETAILS = 10
+
+
+def _percentile(values: List[float], p: float) -> float:
+    """Compute the p-th percentile (0–100) using linear interpolation."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * p / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    frac = k - lo
+    return s[lo] + frac * (s[hi] - s[lo])
+
+
+def detect_cost_spike(entries: List[Dict[str, Any]]) -> DetectorResult:
+    """Flags individual requests whose cost is a far outlier within their session.
+
+    Uses Tukey fences (Q3 + k×IQR) rather than mean/stddev because LLM cost
+    distributions are heavily right-skewed. Computes baselines per
+    system_prompt_hash (session). Sessions with fewer than _SPIKE_MIN_SAMPLE
+    entries are folded into a global baseline.
+
+    Waste = spike_cost - session_P75 (the excess above expected variance),
+    capped at the spike's actual cost per the design rule.
+    """
+    if not entries:
+        return DetectorResult(
+            name="cost_spike",
+            triggered=False,
+            severity="low",
+            estimated_waste_usd=0.0,
+            description="No data to analyze.",
+            details={"spike_count": 0, "spikes": [], "threshold_multiplier": _SPIKE_FENCE_K},
+        )
+
+    # Compute cost per entry, filter out zero-cost (unknown models).
+    entry_costs: List[tuple] = []  # (index, cost, session_hash)
+    for i, e in enumerate(entries):
+        c = _entry_cost(e)
+        if c > 0:
+            h = e.get("system_prompt_hash") or None
+            entry_costs.append((i, c, h))
+
+    if len(entry_costs) < _SPIKE_MIN_SAMPLE:
+        return DetectorResult(
+            name="cost_spike",
+            triggered=False,
+            severity="low",
+            estimated_waste_usd=0.0,
+            description=f"Too few entries with known cost ({len(entry_costs)}) for spike detection.",
+            details={"spike_count": 0, "spikes": [], "threshold_multiplier": _SPIKE_FENCE_K},
+        )
+
+    # Group costs by session hash.
+    session_costs: Dict[str, List[float]] = defaultdict(list)
+    for _, c, h in entry_costs:
+        session_costs[h or "__global__"].append(c)
+
+    # Build baselines: per-session if enough samples, else fold into global pool.
+    global_costs: List[float] = []
+    session_baselines: Dict[str, tuple] = {}  # hash → (median, q3, fence)
+
+    for h, costs in session_costs.items():
+        if len(costs) >= _SPIKE_MIN_SAMPLE:
+            q1 = _percentile(costs, 25)
+            q3 = _percentile(costs, 75)
+            iqr = q3 - q1
+            median = _percentile(costs, 50)
+            fence = q3 + _SPIKE_FENCE_K * iqr
+            session_baselines[h] = (median, q3, fence)
+        else:
+            global_costs.extend(costs)
+
+    # Compute global baseline from entries that didn't form their own session.
+    global_baseline: tuple | None = None
+    if len(global_costs) >= _SPIKE_MIN_SAMPLE:
+        q1 = _percentile(global_costs, 25)
+        q3 = _percentile(global_costs, 75)
+        iqr = q3 - q1
+        median = _percentile(global_costs, 50)
+        fence = q3 + _SPIKE_FENCE_K * iqr
+        global_baseline = (median, q3, fence)
+
+    # Fallback: if global pool is too small, compute from ALL entries combined.
+    # This catches cases where most entries belong to sessions (and have their
+    # own baselines) but a few orphan entries need something to compare against.
+    all_costs = [c for _, c, _ in entry_costs]
+    fallback_baseline: tuple | None = None
+    if global_baseline is None and len(all_costs) >= _SPIKE_MIN_SAMPLE:
+        q1 = _percentile(all_costs, 25)
+        q3 = _percentile(all_costs, 75)
+        iqr = q3 - q1
+        median = _percentile(all_costs, 50)
+        fence = q3 + _SPIKE_FENCE_K * iqr
+        fallback_baseline = (median, q3, fence)
+
+    # Scan entries for spikes.
+    spikes: List[Dict[str, Any]] = []
+    total_waste = 0.0
+
+    for idx, cost, h in entry_costs:
+        session_key = h or "__global__"
+        baseline = session_baselines.get(session_key) or global_baseline or fallback_baseline
+        if baseline is None:
+            continue
+
+        median, q3, fence = baseline
+        if cost > fence and fence > 0:
+            # Waste = excess above Q3 (the "expected high end"), capped at entry cost.
+            excess = min(cost - q3, cost)
+            multiplier = round(cost / median, 1) if median > 0 else 0.0
+            total_waste += excess
+            spikes.append({
+                "index": idx,
+                "cost_usd": round(cost, 4),
+                "session_median_usd": round(median, 4),
+                "session_q3_usd": round(q3, 4),
+                "fence_usd": round(fence, 4),
+                "excess_usd": round(excess, 4),
+                "multiplier": multiplier,
+                "model": entries[idx].get("model", "?"),
+                "session_hash": h,
+                "timestamp": entries[idx].get("timestamp", ""),
+            })
+
+    triggered = len(spikes) > 0
+
+    # Sort by excess descending, cap details.
+    spikes.sort(key=lambda s: s["excess_usd"], reverse=True)
+    spike_count = len(spikes)
+    top_spikes = spikes[:_SPIKE_MAX_DETAILS]
+
+    if triggered:
+        top_cost = top_spikes[0]["cost_usd"]
+        top_mult = top_spikes[0]["multiplier"]
+        description = (
+            f"{spike_count} request{'s' if spike_count != 1 else ''} with anomalous cost detected. "
+            f"Worst: ${top_cost:.2f} ({top_mult}x session median). "
+            f"Estimated avoidable cost: ${total_waste:.2f}."
+        )
+    else:
+        description = "No cost spikes detected."
+
+    return DetectorResult(
+        name="cost_spike",
+        triggered=triggered,
+        severity="high" if triggered else "low",
+        estimated_waste_usd=round(total_waste, 4),
+        description=description,
+        details={
+            "spike_count": spike_count,
+            "spikes": top_spikes,
+            "threshold_multiplier": _SPIKE_FENCE_K,
+        },
     )
