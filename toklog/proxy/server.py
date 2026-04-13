@@ -35,6 +35,7 @@ _UPSTREAM: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
     "anthropic": "https://api.anthropic.com",
     "gemini": "https://generativelanguage.googleapis.com",
+    "codex": "https://chatgpt.com/backend-api/codex",
 }
 
 # Path prefixes already included in _UPSTREAM base URLs.
