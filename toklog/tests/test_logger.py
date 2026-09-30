@@ -156,6 +156,36 @@ class TestReadLogs:
         entries = read_logs()
         assert entries == []
 
+    def test_start_date_drops_earlier_timestamp_in_same_file(self) -> None:
+        """A start_date mid-file drops entries whose own timestamp is earlier,
+        even though all entries fall in the same log file (today's file)."""
+        today = datetime.now(timezone.utc).date()
+        log_entry(_sample_entry(request_id="early", timestamp=f"{today}T01:00:00.000Z"))
+        log_entry(_sample_entry(request_id="late", timestamp=f"{today}T23:00:00.000Z"))
+        start = datetime(today.year, today.month, today.day, 12, 0, 0, tzinfo=timezone.utc)
+        entries = read_logs(start_date=start)
+        assert [e["request_id"] for e in entries] == ["late"]
+
+    def test_end_date_drops_later_timestamp_in_same_file(self) -> None:
+        """An end_date mid-file drops entries whose own timestamp is later,
+        even though all entries fall in the same log file (today's file)."""
+        today = datetime.now(timezone.utc).date()
+        log_entry(_sample_entry(request_id="early", timestamp=f"{today}T01:00:00.000Z"))
+        log_entry(_sample_entry(request_id="late", timestamp=f"{today}T23:00:00.000Z"))
+        end = datetime(today.year, today.month, today.day, 12, 0, 0, tzinfo=timezone.utc)
+        entries = read_logs(end_date=end)
+        assert [e["request_id"] for e in entries] == ["early"]
+
+    def test_missing_or_bad_timestamp_is_kept(self) -> None:
+        """An entry with no timestamp, or one that fails to parse, is kept
+        even when a start_date/end_date would otherwise exclude it."""
+        log_entry(_sample_entry(request_id="no_ts", timestamp=None))
+        log_entry(_sample_entry(request_id="bad_ts", timestamp="not-a-timestamp"))
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 12, 31, tzinfo=timezone.utc)
+        entries = read_logs(start_date=start, end_date=end)
+        assert {e["request_id"] for e in entries} == {"no_ts", "bad_ts"}
+
 
 class TestIsBenchmarkEntry:
     def test_known_id_is_benchmark(self) -> None:

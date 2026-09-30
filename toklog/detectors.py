@@ -15,6 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from toklog.logger import _parse_ts
 from toklog.pricing import (
     _normalize_model_name,
     compute_cost_components,
@@ -103,6 +104,22 @@ def _output_price_per_token(model: str) -> float:
     if price is None:
         return 0.0
     return price["output"] / 1000.0
+
+
+def _schema_token_price(entry: Dict[str, Any]) -> float:
+    """Price for one tool-schema token in this entry.
+
+    Tool schemas sit at the start of the cached prefix, so a call that reads
+    at least as many cache tokens as its schema is almost certainly billing
+    those schema tokens at the cache-read rate, not the full input rate.
+    """
+    cache_read = entry.get("cache_read_tokens") or 0
+    schema_tokens = entry.get("tool_schema_tokens") or 0
+    model = entry.get("model", "")
+    if cache_read > 0 and cache_read >= schema_tokens:
+        cache_prices = get_cache_prices(model, entry.get("provider", ""))
+        return cache_prices["cache_read"] / 1000.0
+    return _input_price_per_token(model)
 
 
 # ---------------------------------------------------------------------------
@@ -200,27 +217,181 @@ def detect_cache_miss(entries: List[Dict[str, Any]]) -> DetectorResult:
 # ---------------------------------------------------------------------------
 
 
+def _cache_creation_ttl_tokens(raw_usage: Any) -> tuple:
+    """Return (t5, t1): max ephemeral_5m/1h input tokens across raw_usage variants.
+
+    Anthropic reports the TTL split under a nested "cache_creation" dict. That
+    dict can appear at the top level of raw_usage (non-streaming) or inside
+    raw_usage["message_start"] / raw_usage["message_delta"] (streaming). We take
+    the max across whichever of those three dicts is present.
+    """
+    t5 = 0
+    t1 = 0
+    if isinstance(raw_usage, dict):
+        for candidate in (raw_usage, raw_usage.get("message_start"), raw_usage.get("message_delta")):
+            if not isinstance(candidate, dict):
+                continue
+            cache_creation = candidate.get("cache_creation")
+            if isinstance(cache_creation, dict):
+                t5 = max(t5, cache_creation.get("ephemeral_5m_input_tokens") or 0)
+                t1 = max(t1, cache_creation.get("ephemeral_1h_input_tokens") or 0)
+    return t5, t1
+
+
+def _call_ttl(entry: Dict[str, Any]) -> tuple:
+    """TTL seconds and mixed flag for a cache-writing call (cc > 0)."""
+    t5, t1 = _cache_creation_ttl_tokens(entry.get("raw_usage"))
+    if t1 > 0 and t5 == 0:
+        return 3600, False
+    if t1 > 0 and t5 > 0:
+        return 300, True
+    return 300, False
+
+
+def _classify_cache_writes(entries: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    """Classify each classifiable Anthropic call into cache-write token buckets.
+
+    A row is produced only for classifiable entries: provider == "anthropic",
+    system_prompt_hash is not None, error is not truthy, timestamp parses, and
+    total_message_chars is an int.
+
+    Calls are grouped into namespaces (model, api_key_hint, tool_names,
+    system_prompt_hash) and, within a namespace, threaded by conversation using
+    total_message_chars (append-only growth) and cached length. Only a write
+    against the SAME thread's most recent cache observation counts as
+    first/incremental/live-churn/ttl-rewrite/unclassified/ambiguous — see
+    audit/threads_and_overlap.py:62-103 for the reference model. Cross-thread
+    reuse (a different parallel conversation sharing the same cache) is not
+    counted here.
+    """
+    classifiable: List[tuple] = []  # (index, entry, ts_epoch)
+    for i, e in enumerate(entries):
+        if e.get("provider") != "anthropic":
+            continue
+        if e.get("system_prompt_hash") is None:
+            continue
+        if e.get("error"):
+            continue
+        parsed = _parse_ts(e.get("timestamp"))
+        if parsed is None:
+            continue
+        if not isinstance(e.get("total_message_chars"), int):
+            continue
+        classifiable.append((i, e, parsed.timestamp()))
+
+    by_namespace: Dict[tuple, List[tuple]] = defaultdict(list)
+    for i, e, t in classifiable:
+        namespace = (
+            e.get("model"),
+            e.get("api_key_hint"),
+            tuple(e.get("tool_names") or ()),
+            e.get("system_prompt_hash"),
+        )
+        by_namespace[namespace].append((i, e, t))
+
+    rows: Dict[int, Dict[str, Any]] = {}
+
+    for namespace, calls in by_namespace.items():
+        sorted_calls = sorted(calls, key=lambda c: c[2])  # stable sort by ts
+        threads: List[Dict[str, Any]] = []
+
+        for i, e, t in sorted_calls:
+            cr = e.get("cache_read_tokens") or 0
+            cc = e.get("cache_creation_tokens") or 0
+            msg = e["total_message_chars"]
+            effective_prompt = (e.get("input_tokens") or 0) + cr + cc
+
+            candidates = [
+                th for th in threads
+                if th["last_msg"] <= msg and th["last_L"] <= effective_prompt
+            ]
+            thread = None
+            if candidates:
+                thread = max(
+                    candidates,
+                    key=lambda th: (th["last_msg"], th["last_t"] if th["last_t"] is not None else float("-inf")),
+                )
+            if thread is None:
+                thread = {"last_msg": 0, "last_L": 0, "last_t": None, "ttl_s": 300, "mixed": False}
+                threads.append(thread)
+
+            row = {
+                "namespace": namespace,
+                "live_churn_tokens": 0,
+                "live_churn_usd": 0.0,
+                "ttl_rewrite_tokens": 0,
+                "ttl_rewrite_usd": 0.0,
+                "first_write_tokens": 0,
+                "incremental_tokens": 0,
+                "unclassified_write_tokens": 0,
+                "ambiguous_tokens": 0,
+            }
+
+            if cc > 0:
+                if thread["last_L"] == 0:
+                    row["first_write_tokens"] = cc
+                else:
+                    miss = max(0, min(cc, thread["last_L"] - cr))
+                    gap = t - thread["last_t"]
+                    if thread["mixed"]:
+                        row["ambiguous_tokens"] = miss
+                    elif gap <= thread["ttl_s"]:
+                        row["live_churn_tokens"] = miss
+                    elif gap <= 3600:
+                        row["ttl_rewrite_tokens"] = miss
+                    else:
+                        row["unclassified_write_tokens"] = miss
+                    row["incremental_tokens"] = cc - miss
+
+                cache_prices = get_cache_prices(e.get("model", ""), "anthropic")
+                delta = (cache_prices["cache_write"] - cache_prices["cache_read"]) / 1000.0
+                row["live_churn_usd"] = row["live_churn_tokens"] * delta
+                row["ttl_rewrite_usd"] = row["ttl_rewrite_tokens"] * delta
+
+            rows[i] = row
+
+            # Update thread state for the next call in this namespace.
+            thread["last_msg"] = msg
+            if cr + cc > 0:
+                thread["last_L"] = cr + cc
+                thread["last_t"] = t
+            if cc > 0:
+                thread["ttl_s"], thread["mixed"] = _call_ttl(e)
+
+    return rows
+
+
+def _counted_live_churn_usd(entries: List[Dict[str, Any]]) -> Dict[int, float]:
+    """Per-call live_churn_usd for rows whose namespace has >= 3 classifiable calls.
+
+    This is the single source of what the churn detector counts as waste.
+    detect_cost_spike subtracts from it to avoid double-counting the same
+    dollars as both cache-write churn and a cost spike.
+    """
+    rows = _classify_cache_writes(entries)
+    namespace_counts: Dict[tuple, int] = defaultdict(int)
+    for row in rows.values():
+        namespace_counts[row["namespace"]] += 1
+    return {
+        idx: row["live_churn_usd"]
+        for idx, row in rows.items()
+        if namespace_counts[row["namespace"]] >= 3
+    }
+
+
 def detect_cache_write_churn(entries: List[Dict[str, Any]]) -> DetectorResult:
-    """Fires when prompt cache is repeatedly recreated instead of being read.
+    """Fires when a live prompt cache is rewritten instead of being read.
 
-    Within a session (same system_prompt_hash), after the initial cache creation,
-    subsequent writes are churn — paying cache_write price for tokens that should
-    cost cache_read price.
+    A cache-writing call (cache_creation_tokens > 0) is live churn only when it
+    rewrites tokens that its OWN conversation thread had cached moments earlier
+    (gap <= the cache's TTL, 300s or 3600s) — see _classify_cache_writes(). New
+    conversation turns, first writes, and rewrites after the TTL expired are not
+    counted as waste.
 
-    Trigger conditions:
-    - Same system_prompt_hash with ≥3 calls
-    - creation_ratio > 0.4 (unhealthy cache pattern) OR absolute waste > $0.50
-
-    creation_ratio = total_cache_creation / (total_cache_creation + total_cache_read)
-    A healthy session has ratio < 0.1 (first call writes, rest read).
-
-    Waste formula: churn_tokens * (cache_write_price - cache_read_price)
-    where churn_tokens = cache_creation after the first creation in each session.
-    This is conservative: it's the difference between what was paid and the minimum
-    that would have been paid if caching worked optimally.
-
-    Only Anthropic calls are eligible — OpenAI prompt caching is automatic and not
-    user-controllable.
+    Namespaces (model, api_key_hint, tool_names, system_prompt_hash) with fewer
+    than 3 classifiable calls are skipped — too little data for a reliable
+    signal. estimated_waste_usd is the sum of _counted_live_churn_usd(), which
+    detect_cost_spike also uses to avoid double-counting the same dollars.
     """
     if not entries:
         return DetectorResult(
@@ -232,85 +403,104 @@ def detect_cache_write_churn(entries: List[Dict[str, Any]]) -> DetectorResult:
             details={},
         )
 
-    eligible = [
-        e for e in entries
-        if e.get("system_prompt_hash") is not None
-        and e.get("provider") == "anthropic"
-    ]
-    coverage_pct = round(len(eligible) / len(entries) * 100, 1) if entries else 0.0
+    rows = _classify_cache_writes(entries)
+    coverage_pct = round(len(rows) / len(entries) * 100, 1) if entries else 0.0
+    counted = _counted_live_churn_usd(entries)
 
-    by_hash: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for e in eligible:
-        by_hash[e["system_prompt_hash"]].append(e)
+    by_namespace: Dict[tuple, List[int]] = defaultdict(list)
+    for idx, row in rows.items():
+        by_namespace[row["namespace"]].append(idx)
 
-    waste = 0.0
+    total_live_churn_tokens = 0
+    total_ttl_rewrite_tokens = 0
+    total_ttl_rewrite_usd = 0.0
+    total_first_write_tokens = 0
+    total_incremental_tokens = 0
+    total_unclassified_write_tokens = 0
+    total_ambiguous_tokens = 0
+    flagged_namespaces = 0
     flagged_sessions: List[Dict[str, Any]] = []
 
-    for h, calls in by_hash.items():
-        if len(calls) < 3:
+    for namespace, idxs in by_namespace.items():
+        if len(idxs) < 3:
             continue
 
-        sorted_calls = sorted(calls, key=lambda c: c.get("timestamp", ""))
+        model, _api_key_hint, _tool_names, system_prompt_hash = namespace
 
-        total_cr = sum(c.get("cache_read_tokens") or 0 for c in sorted_calls)
-        total_cc = sum(c.get("cache_creation_tokens") or 0 for c in sorted_calls)
-        total_cache = total_cr + total_cc
+        namespace_live_churn_tokens = 0
+        namespace_live_churn_usd = 0.0
+        namespace_cc = 0
+        namespace_cr = 0
 
-        if total_cache == 0:
-            continue
+        for idx in idxs:
+            row = rows[idx]
+            e = entries[idx]
+            namespace_cc += e.get("cache_creation_tokens") or 0
+            namespace_cr += e.get("cache_read_tokens") or 0
+            namespace_live_churn_tokens += row["live_churn_tokens"]
+            namespace_live_churn_usd += row["live_churn_usd"]
+            total_ttl_rewrite_tokens += row["ttl_rewrite_tokens"]
+            total_ttl_rewrite_usd += row["ttl_rewrite_usd"]
+            total_first_write_tokens += row["first_write_tokens"]
+            total_incremental_tokens += row["incremental_tokens"]
+            total_unclassified_write_tokens += row["unclassified_write_tokens"]
+            total_ambiguous_tokens += row["ambiguous_tokens"]
 
-        creation_ratio = total_cc / total_cache
+        total_live_churn_tokens += namespace_live_churn_tokens
 
-        # Compute churn tokens: all cache_creation after the first creation call
-        churn_tokens = 0
-        first_seen = False
-        for c in sorted_calls:
-            cc = c.get("cache_creation_tokens") or 0
-            if cc > 0:
-                if first_seen:
-                    churn_tokens += cc
-                else:
-                    first_seen = True
-
-        if churn_tokens == 0:
-            continue
-
-        model = sorted_calls[0].get("model", "")
-        cache_prices = get_cache_prices(model, "anthropic")
-        write_price = cache_prices["cache_write"] / 1000.0
-        read_price = cache_prices["cache_read"] / 1000.0
-        session_waste = churn_tokens * (write_price - read_price)
-
-        # Flag if creation ratio is unhealthy (>40%) OR absolute waste is significant (>$0.50)
-        if creation_ratio > 0.4 or session_waste > 0.50:
-            waste += session_waste
+        if namespace_live_churn_usd > 0:
+            flagged_namespaces += 1
+            total_namespace_cache = namespace_cc + namespace_cr
+            creation_ratio = round(namespace_cc / total_namespace_cache, 2) if total_namespace_cache else 0.0
             flagged_sessions.append({
-                "hash": h,
-                "calls": len(calls),
-                "creation_ratio": round(creation_ratio, 2),
-                "churn_tokens": churn_tokens,
-                "waste_usd": round(session_waste, 4),
+                "hash": system_prompt_hash,
+                "model": model,
+                "calls": len(idxs),
+                "creation_ratio": creation_ratio,
+                "churn_tokens": namespace_live_churn_tokens,
+                "waste_usd": round(namespace_live_churn_usd, 4),
             })
 
-    flagged_sessions.sort(key=lambda x: -x["waste_usd"])
-    triggered = len(flagged_sessions) > 0
+    flagged_sessions.sort(key=lambda x: (-x["waste_usd"], x["hash"]))
+    flagged_sessions = flagged_sessions[:20]
+
+    waste = sum(counted.values())
+    triggered = flagged_namespaces > 0
+
+    if triggered:
+        description_parts = [
+            f"{flagged_namespaces} cache namespace(s) rewrote a live prompt cache instead of "
+            f"reading it. Estimated live cache-rewrite waste: ${waste:.4f}."
+        ]
+    else:
+        description_parts = ["No cache write churn detected."]
+
+    if total_ttl_rewrite_usd > 0:
+        description_parts.append(
+            f"{total_ttl_rewrite_tokens} tokens were rewritten after the 5-min cache expired "
+            f"(gap <= 60 min, write-read ${total_ttl_rewrite_usd:.4f}); a 1-hour cache TTL can "
+            "save part of this. Not counted as waste."
+        )
+
+    description_parts.append(f"({coverage_pct}% of calls are Anthropic with system_prompt_hash.)")
+
     return DetectorResult(
         name="cache_write_churn",
         triggered=triggered,
         severity="high",
         estimated_waste_usd=round(waste, 4),
-        description=(
-            f"{len(flagged_sessions)} session(s) recreating prompt cache instead of reading it. "
-            f"Estimated waste: ${waste:.4f}. "
-            f"Use consistent cache_control breakpoints to avoid re-creation. "
-            f"({coverage_pct}% of calls are Anthropic with system_prompt_hash.)"
-            if triggered
-            else f"No cache write churn detected. "
-                 f"({coverage_pct}% of calls are Anthropic with system_prompt_hash.)"
-        ),
+        description=" ".join(description_parts),
         details={
             "flagged_sessions": flagged_sessions,
             "flagged_coverage_pct": coverage_pct,
+            "live_churn_tokens": total_live_churn_tokens,
+            "ttl_rewrite_tokens": total_ttl_rewrite_tokens,
+            "ttl_rewrite_usd": round(total_ttl_rewrite_usd, 4),
+            "first_write_tokens": total_first_write_tokens,
+            "incremental_tokens": total_incremental_tokens,
+            "unclassified_write_tokens": total_unclassified_write_tokens,
+            "ambiguous_tokens": total_ambiguous_tokens,
+            "flagged_namespaces": flagged_namespaces,
         },
     )
 
@@ -434,11 +624,11 @@ def detect_tool_schema_bloat(entries: List[Dict[str, Any]]) -> DetectorResult:
     waste = 0.0
     for e in zero_use_entries:
         schema_tokens = e.get("tool_schema_tokens") or 0
-        price = _input_price_per_token(e.get("model", ""))
+        price = _schema_token_price(e)
         waste += schema_tokens * price
     for e in extreme_ratio_entries:
         schema_tokens = e.get("tool_schema_tokens") or 0
-        price = _input_price_per_token(e.get("model", ""))
+        price = _schema_token_price(e)
         # Conservative estimate: assume ~50% of schema could be trimmed
         waste += schema_tokens * price * 0.5
 
@@ -959,6 +1149,8 @@ def detect_cost_spike(entries: List[Dict[str, Any]]) -> DetectorResult:
             details={"spike_count": 0, "spikes": [], "threshold_multiplier": _SPIKE_FENCE_K},
         )
 
+    counted_churn = _counted_live_churn_usd(entries)
+
     # Group costs by session hash.
     session_costs: Dict[str, List[float]] = defaultdict(list)
     for _, c, h in entry_costs:
@@ -1014,8 +1206,11 @@ def detect_cost_spike(entries: List[Dict[str, Any]]) -> DetectorResult:
 
         median, q3, fence = baseline
         if cost > fence and fence > 0:
-            # Waste = excess above Q3 (the "expected high end"), capped at entry cost.
-            excess = min(cost - q3, cost)
+            # Waste = excess above Q3 (the "expected high end"), capped at entry cost,
+            # minus any dollars already counted as cache-write churn on this same call.
+            excess = max(0.0, min(cost - q3, cost) - counted_churn.get(idx, 0.0))
+            if excess <= 0:
+                continue
             multiplier = round(cost / median, 1) if median > 0 else 0.0
             total_waste += excess
             spikes.append({

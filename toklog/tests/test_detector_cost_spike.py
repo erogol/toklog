@@ -297,3 +297,72 @@ class TestCostSpikeDetails:
             assert "session_median_usd" in spike
             assert "multiplier" in spike
             assert "model" in spike
+
+
+# ---------------------------------------------------------------------------
+# SPEC 2026-09-30: subtract counted live cache-write churn from spike excess
+# ---------------------------------------------------------------------------
+
+class TestCostSpikeChurnOverlap:
+    """detect_cost_spike must not double-count dollars _counted_live_churn_usd
+    already attributes to cache_write_churn. We patch _counted_live_churn_usd
+    directly so each case isolates the C-rule arithmetic in detectors.py:
+    excess = max(0.0, min(cost - q3, cost) - counted.get(idx, 0.0))."""
+
+    def _spike_session(self, hash_: str) -> tuple:
+        """5 uniform baseline entries + 1 clear spike entry. Returns (entries, spike_idx)."""
+        entries = _make_session(5, hash=hash_)
+        entries.append(_entry(
+            input_tokens=250000, output_tokens=5000,
+            system_prompt_hash=hash_,
+            timestamp="2026-04-07T10:10:00Z",
+        ))
+        return entries, len(entries) - 1
+
+    def test_spike_fully_covered_by_churn_is_dropped(self, monkeypatch):
+        """When counted churn on the spike call equals its full excess, the spike
+        is dropped entirely — those dollars were already reported as churn."""
+        import toklog.detectors as det
+
+        entries, idx = self._spike_session("churnA")
+        baseline = detect_cost_spike(entries)
+        spike = next(s for s in baseline.details["spikes"] if s["index"] == idx)
+        full_excess = spike["excess_usd"]
+        assert full_excess > 0
+
+        monkeypatch.setattr(det, "_counted_live_churn_usd", lambda entries: {idx: full_excess})
+        result = det.detect_cost_spike(entries)
+        assert not any(s["index"] == idx for s in result.details["spikes"])
+
+    def test_spike_partly_churn_is_reduced(self, monkeypatch):
+        """When counted churn covers only part of the excess, the spike stays,
+        with excess_usd reduced by exactly the counted churn dollars."""
+        import toklog.detectors as det
+
+        entries, idx = self._spike_session("churnB")
+        baseline = detect_cost_spike(entries)
+        spike = next(s for s in baseline.details["spikes"] if s["index"] == idx)
+        full_excess = spike["excess_usd"]
+        partial = full_excess / 2.0
+
+        monkeypatch.setattr(det, "_counted_live_churn_usd", lambda entries: {idx: partial})
+        result = det.detect_cost_spike(entries)
+        reduced = next(s for s in result.details["spikes"] if s["index"] == idx)
+        assert reduced["excess_usd"] == pytest.approx(round(full_excess - partial, 4))
+        assert reduced["excess_usd"] > 0
+
+    def test_churn_in_small_namespace_not_subtracted(self, monkeypatch):
+        """_counted_live_churn_usd already excludes namespaces with < 3
+        classifiable calls, so an empty churn map leaves the spike's excess
+        untouched — nothing gets subtracted."""
+        import toklog.detectors as det
+
+        entries, idx = self._spike_session("churnC")
+        baseline = detect_cost_spike(entries)
+        spike = next(s for s in baseline.details["spikes"] if s["index"] == idx)
+        full_excess = spike["excess_usd"]
+
+        monkeypatch.setattr(det, "_counted_live_churn_usd", lambda entries: {})
+        result = det.detect_cost_spike(entries)
+        unchanged = next(s for s in result.details["spikes"] if s["index"] == idx)
+        assert unchanged["excess_usd"] == pytest.approx(full_excess)

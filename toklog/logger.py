@@ -87,6 +87,25 @@ def _is_benchmark_entry(entry: dict) -> bool:
     return entry.get("request_id") in _BENCH_REQUEST_IDS
 
 
+def _parse_ts(value: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp string into an aware UTC datetime.
+
+    A trailing 'Z' is treated as '+00:00'. A naive value (no tz info) is
+    assumed to already be UTC. Returns None when value is missing or does
+    not parse — callers must keep the entry in that case, not drop it.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def read_logs(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
@@ -118,10 +137,17 @@ def read_logs(
                     if line:
                         try:
                             entry = json.loads(line)
-                            if not _is_benchmark_entry(entry):
-                                entries.append(entry)
                         except json.JSONDecodeError:
                             continue
+                        if _is_benchmark_entry(entry):
+                            continue
+                        entry_ts = _parse_ts(entry.get("timestamp"))
+                        if entry_ts is not None:
+                            if start_date and entry_ts < start_date:
+                                continue
+                            if end_date and entry_ts > end_date:
+                                continue
+                        entries.append(entry)
         except OSError:
             continue
 

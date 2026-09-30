@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 from unittest.mock import patch
 
 import pytest
 
 from toklog.detectors import (
+    _classify_cache_writes,
     _effective_input,
     _entry_cost,
     detect_cache_miss,
@@ -20,6 +21,7 @@ from toklog.detectors import (
     detect_unbounded_context,
     run_all,
 )
+from toklog.pricing import get_cache_prices
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +53,7 @@ def _base_entry(**overrides: Any) -> Dict[str, Any]:
         "error": False,
         "error_type": None,
         "request_id": "req_1",
+        "total_message_chars": 1000,
     }
     entry.update(overrides)
     return entry
@@ -698,3 +701,281 @@ class TestRunAll:
             "credential_sharing",
             "cost_spike",
         }
+
+
+# ---------------------------------------------------------------------------
+# SPEC 2026-09-30: thread-aware cache-write churn classification
+# ---------------------------------------------------------------------------
+
+_MODEL = "claude-sonnet-4-6"
+
+
+def _anthro_entry(**overrides: Any) -> Dict[str, Any]:
+    overrides.setdefault("model", _MODEL)
+    overrides.setdefault("provider", "anthropic")
+    return _base_entry(**overrides)
+
+
+class TestClassifyCacheWritesGoodCaching:
+    def test_growing_conversation_good_caching_no_waste(self) -> None:
+        """Each call reads the full previous prefix and writes only the new turn."""
+        entries = [
+            _anthro_entry(
+                system_prompt_hash="h1", input_tokens=3,
+                cache_read_tokens=0, cache_creation_tokens=1000, total_message_chars=500,
+                timestamp="2025-03-09T10:00:00.000Z",
+            ),
+            _anthro_entry(
+                system_prompt_hash="h1", input_tokens=3,
+                cache_read_tokens=1000, cache_creation_tokens=200, total_message_chars=700,
+                timestamp="2025-03-09T10:00:30.000Z",
+            ),
+            _anthro_entry(
+                system_prompt_hash="h1", input_tokens=3,
+                cache_read_tokens=1200, cache_creation_tokens=200, total_message_chars=900,
+                timestamp="2025-03-09T10:01:00.000Z",
+            ),
+            _anthro_entry(
+                system_prompt_hash="h1", input_tokens=3,
+                cache_read_tokens=1400, cache_creation_tokens=200, total_message_chars=1100,
+                timestamp="2025-03-09T10:01:30.000Z",
+            ),
+        ]
+        result = detect_cache_write_churn(entries)
+        assert result.triggered is False
+        assert result.estimated_waste_usd == 0.0
+        assert result.details["live_churn_tokens"] == 0
+
+    def test_two_interleaved_threads_both_cache_well(self) -> None:
+        """Two parallel conversations sharing one namespace, each caching well → $0."""
+        entries = [
+            _anthro_entry(system_prompt_hash="h2", input_tokens=3,
+                           cache_read_tokens=0, cache_creation_tokens=1000, total_message_chars=500,
+                           timestamp="2025-03-09T10:00:00.000Z"),
+            _anthro_entry(system_prompt_hash="h2", input_tokens=3,
+                           cache_read_tokens=0, cache_creation_tokens=800, total_message_chars=300,
+                           timestamp="2025-03-09T10:00:10.000Z"),
+            _anthro_entry(system_prompt_hash="h2", input_tokens=3,
+                           cache_read_tokens=1000, cache_creation_tokens=200, total_message_chars=700,
+                           timestamp="2025-03-09T10:00:20.000Z"),
+            _anthro_entry(system_prompt_hash="h2", input_tokens=3,
+                           cache_read_tokens=800, cache_creation_tokens=100, total_message_chars=450,
+                           timestamp="2025-03-09T10:00:30.000Z"),
+            _anthro_entry(system_prompt_hash="h2", input_tokens=3,
+                           cache_read_tokens=1200, cache_creation_tokens=200, total_message_chars=900,
+                           timestamp="2025-03-09T10:00:40.000Z"),
+            _anthro_entry(system_prompt_hash="h2", input_tokens=3,
+                           cache_read_tokens=900, cache_creation_tokens=100, total_message_chars=600,
+                           timestamp="2025-03-09T10:00:50.000Z"),
+        ]
+        result = detect_cache_write_churn(entries)
+        assert result.triggered is False
+        assert result.estimated_waste_usd == 0.0
+
+    def test_ttl_cadence_job_no_waste_advisory_present(self) -> None:
+        """A 20-min cadence job with cr=0 each call rewrites after TTL expiry, not live churn."""
+        entries = [
+            _anthro_entry(system_prompt_hash="h3", input_tokens=3,
+                           cache_read_tokens=0, cache_creation_tokens=5000, total_message_chars=500,
+                           timestamp="2025-03-09T10:00:00.000Z"),
+            _anthro_entry(system_prompt_hash="h3", input_tokens=3,
+                           cache_read_tokens=0, cache_creation_tokens=5000, total_message_chars=500,
+                           timestamp="2025-03-09T10:20:00.000Z"),
+            _anthro_entry(system_prompt_hash="h3", input_tokens=3,
+                           cache_read_tokens=0, cache_creation_tokens=5000, total_message_chars=500,
+                           timestamp="2025-03-09T10:40:00.000Z"),
+        ]
+        result = detect_cache_write_churn(entries)
+        assert result.triggered is False
+        assert result.estimated_waste_usd == 0.0
+        assert result.details["ttl_rewrite_tokens"] == 10000
+        assert result.details["ttl_rewrite_usd"] > 0
+        assert "5-min cache expired" in result.description
+        assert "Not counted as waste" in result.description
+
+
+class TestClassifyCacheWritesLiveChurn:
+    def test_live_rewrite_exact_token_split(self) -> None:
+        """gap 60s, previous L=100k, now cr=40k cc=70k → 60k live churn, 10k incremental."""
+        entries = [
+            _anthro_entry(system_prompt_hash="h4", input_tokens=3,
+                           cache_read_tokens=0, cache_creation_tokens=100000, total_message_chars=1000,
+                           timestamp="2025-03-09T10:00:00.000Z"),
+            _anthro_entry(system_prompt_hash="h4", input_tokens=3,
+                           cache_read_tokens=40000, cache_creation_tokens=70000, total_message_chars=1100,
+                           timestamp="2025-03-09T10:01:00.000Z"),
+            _anthro_entry(system_prompt_hash="h4", input_tokens=3,
+                           cache_read_tokens=110000, cache_creation_tokens=1000, total_message_chars=1300,
+                           timestamp="2025-03-09T10:01:30.000Z"),
+        ]
+        result = detect_cache_write_churn(entries)
+        assert result.details["live_churn_tokens"] == 60000
+        assert result.details["incremental_tokens"] == 11000  # 10k (call2) + 1k (call3)
+        prices = get_cache_prices(_MODEL, "anthropic")
+        delta = (prices["cache_write"] - prices["cache_read"]) / 1000.0
+        assert result.estimated_waste_usd == pytest.approx(round(60000 * delta, 4))
+        assert result.triggered is True
+
+    def test_mixed_models_same_hash_separate_namespaces(self) -> None:
+        """Same system_prompt_hash, two models → priced separately, two flagged namespaces."""
+        entries = [
+            # Model A: claude-sonnet-4-6
+            _anthro_entry(model="claude-sonnet-4-6", system_prompt_hash="shared",
+                           input_tokens=3, cache_read_tokens=0, cache_creation_tokens=10000,
+                           total_message_chars=100, timestamp="2025-03-09T10:00:00.000Z"),
+            _anthro_entry(model="claude-sonnet-4-6", system_prompt_hash="shared",
+                           input_tokens=3, cache_read_tokens=4000, cache_creation_tokens=7000,
+                           total_message_chars=110, timestamp="2025-03-09T10:01:00.000Z"),
+            _anthro_entry(model="claude-sonnet-4-6", system_prompt_hash="shared",
+                           input_tokens=3, cache_read_tokens=11000, cache_creation_tokens=500,
+                           total_message_chars=120, timestamp="2025-03-09T10:01:30.000Z"),
+            # Model B: claude-opus-4-6, same hash → different namespace
+            _anthro_entry(model="claude-opus-4-6", system_prompt_hash="shared",
+                           input_tokens=3, cache_read_tokens=0, cache_creation_tokens=20000,
+                           total_message_chars=200, timestamp="2025-03-09T10:00:05.000Z"),
+            _anthro_entry(model="claude-opus-4-6", system_prompt_hash="shared",
+                           input_tokens=3, cache_read_tokens=8000, cache_creation_tokens=14000,
+                           total_message_chars=210, timestamp="2025-03-09T10:01:05.000Z"),
+            _anthro_entry(model="claude-opus-4-6", system_prompt_hash="shared",
+                           input_tokens=3, cache_read_tokens=22000, cache_creation_tokens=500,
+                           total_message_chars=220, timestamp="2025-03-09T10:01:35.000Z"),
+        ]
+        result = detect_cache_write_churn(entries)
+        assert result.details["live_churn_tokens"] == 6000 + 12000
+        sessions = {s["model"]: s for s in result.details["flagged_sessions"]}
+        assert set(sessions.keys()) == {"claude-sonnet-4-6", "claude-opus-4-6"}
+        assert sessions["claude-sonnet-4-6"]["churn_tokens"] == 6000
+        assert sessions["claude-opus-4-6"]["churn_tokens"] == 12000
+        price_a = get_cache_prices("claude-sonnet-4-6", "anthropic")
+        price_b = get_cache_prices("claude-opus-4-6", "anthropic")
+        delta_a = (price_a["cache_write"] - price_a["cache_read"]) / 1000.0
+        delta_b = (price_b["cache_write"] - price_b["cache_read"]) / 1000.0
+        assert sessions["claude-sonnet-4-6"]["waste_usd"] == pytest.approx(round(6000 * delta_a, 4))
+        assert sessions["claude-opus-4-6"]["waste_usd"] == pytest.approx(round(12000 * delta_b, 4))
+
+    def test_one_hour_ttl_survives_read_only_call(self) -> None:
+        """A read-only call between a 1h write and a 20-min-gap rewrite keeps the 1h TTL."""
+        entries = [
+            _anthro_entry(
+                system_prompt_hash="h6", input_tokens=3,
+                cache_read_tokens=0, cache_creation_tokens=50000, total_message_chars=100,
+                timestamp="2025-03-09T10:00:00.000Z",
+                raw_usage={"cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 50000}},
+            ),
+            _anthro_entry(
+                system_prompt_hash="h6", input_tokens=3,
+                cache_read_tokens=50000, cache_creation_tokens=0, total_message_chars=150,
+                timestamp="2025-03-09T10:10:00.000Z",
+            ),
+            _anthro_entry(
+                system_prompt_hash="h6", input_tokens=3,
+                cache_read_tokens=10000, cache_creation_tokens=45000, total_message_chars=200,
+                timestamp="2025-03-09T10:30:00.000Z",
+            ),
+        ]
+        result = detect_cache_write_churn(entries)
+        assert result.details["live_churn_tokens"] == 40000
+        assert result.details["ttl_rewrite_tokens"] == 0
+        assert result.triggered is True
+
+    def test_mixed_5m_1h_write_then_rewrite_is_ambiguous(self) -> None:
+        """A write split across both TTLs makes the next rewrite ambiguous, not waste."""
+        entries = [
+            _anthro_entry(
+                system_prompt_hash="h7", input_tokens=3,
+                cache_read_tokens=0, cache_creation_tokens=50000, total_message_chars=100,
+                timestamp="2025-03-09T10:00:00.000Z",
+                raw_usage={"cache_creation": {"ephemeral_5m_input_tokens": 30000, "ephemeral_1h_input_tokens": 20000}},
+            ),
+            _anthro_entry(
+                system_prompt_hash="h7", input_tokens=3,
+                cache_read_tokens=10000, cache_creation_tokens=42000, total_message_chars=110,
+                timestamp="2025-03-09T10:01:00.000Z",
+            ),
+            _anthro_entry(
+                system_prompt_hash="h7", input_tokens=3,
+                cache_read_tokens=52000, cache_creation_tokens=1000, total_message_chars=120,
+                timestamp="2025-03-09T10:01:30.000Z",
+            ),
+        ]
+        result = detect_cache_write_churn(entries)
+        assert result.details["ambiguous_tokens"] == 40000
+        assert result.details["live_churn_tokens"] == 0
+        assert result.details["ttl_rewrite_tokens"] == 0
+        assert result.estimated_waste_usd == 0.0
+
+    def test_gap_over_60_min_is_unclassified(self) -> None:
+        """A rewrite after more than 60 minutes is neither waste nor an advisory."""
+        entries = [
+            _anthro_entry(
+                system_prompt_hash="h8", input_tokens=3,
+                cache_read_tokens=0, cache_creation_tokens=50000, total_message_chars=100,
+                timestamp="2025-03-09T10:00:00.000Z",
+            ),
+            _anthro_entry(
+                system_prompt_hash="h8", input_tokens=3,
+                cache_read_tokens=10000, cache_creation_tokens=45000, total_message_chars=110,
+                timestamp="2025-03-09T11:01:40.000Z",  # gap = 3700s > 3600s
+            ),
+            _anthro_entry(
+                system_prompt_hash="h8", input_tokens=3,
+                cache_read_tokens=55000, cache_creation_tokens=1000, total_message_chars=120,
+                timestamp="2025-03-09T11:02:10.000Z",
+            ),
+        ]
+        result = detect_cache_write_churn(entries)
+        assert result.details["unclassified_write_tokens"] == 40000
+        assert result.details["live_churn_tokens"] == 0
+        assert result.estimated_waste_usd == 0.0
+        assert "5-min cache expired" not in result.description
+
+
+class TestClassifyCacheWritesRobustness:
+    def test_missing_total_message_chars_or_bad_timestamp_not_classified(self) -> None:
+        """Missing total_message_chars or an unparseable timestamp: excluded, no crash."""
+        entries = [
+            _anthro_entry(
+                system_prompt_hash="h9", cache_creation_tokens=5000,
+                total_message_chars=None,
+                timestamp="2025-03-09T10:00:00.000Z",
+            ),
+            _anthro_entry(
+                system_prompt_hash="h9", cache_creation_tokens=5000,
+                timestamp="not-a-timestamp",
+            ),
+        ]
+        rows = _classify_cache_writes(entries)
+        assert rows == {}
+        result = detect_cache_write_churn(entries)
+        assert result.triggered is False
+        assert result.details["flagged_sessions"] == []
+
+
+class TestToolSchemaBloatCacheReadPrice:
+    def test_cache_read_covers_schema_uses_cache_read_price(self) -> None:
+        """cr >= schema_tokens → schema priced at the cache-read rate, not full input."""
+        entries = [
+            _anthro_entry(
+                tool_count=5, tool_schema_tokens=800, tool_calls_made=0,
+                cache_read_tokens=1000,
+            )
+            for _ in range(5)
+        ]
+        result = detect_tool_schema_bloat(entries)
+        prices = get_cache_prices(_MODEL, "anthropic")
+        expected = 5 * 800 * (prices["cache_read"] / 1000.0)
+        assert result.estimated_waste_usd == pytest.approx(round(expected, 4))
+
+    def test_no_cache_read_uses_input_price(self) -> None:
+        """cr == 0 → schema still priced at the full input rate."""
+        entries = [
+            _anthro_entry(
+                tool_count=5, tool_schema_tokens=800, tool_calls_made=0,
+                cache_read_tokens=0,
+            )
+            for _ in range(5)
+        ]
+        result = detect_tool_schema_bloat(entries)
+        input_price = 0.003 / 1000.0  # claude-sonnet-4-6 input price
+        expected = 5 * 800 * input_price
+        assert result.estimated_waste_usd == pytest.approx(round(expected, 4))
