@@ -185,6 +185,16 @@ footer a { color: #58a6ff; text-decoration: none; }
         <div class="detector-name">{{ det.name }} <span class="detector-waste">— est. waste ${{ "%.4f"|format(det.estimated_waste_usd) }}</span></div>
         <div style="color:#8b949e; font-size:13px; margin-top:2px;">{{ det.description }}</div>
       </div>
+      {% elif det.name == "cache_write_churn" and det.details.ttl_rewrite_tokens and det.details.ttl_rewrite_tokens > 0 %}
+      <span class="detector-icon" style="color:#58a6ff;">&#128161;</span>
+      <div>
+        <span class="detector-name" style="color:#8b949e;">{{ det.name }}</span>
+        <span style="color:#58a6ff; font-size:12px; margin-left:8px;">Cache TTL advice — advisory only, not counted as waste</span>
+        <div style="color:#8b949e; font-size:13px; margin-top:2px;">
+          {{ "{:,}".format(det.details.ttl_rewrite_tokens) }} token(s) rewritten after the 5-min cache expired
+          (write-minus-read difference ${{ "%.4f"|format(det.details.ttl_rewrite_usd or 0.0) }}). A 1-hour cache TTL may save part of this amount.
+        </div>
+      </div>
       {% else %}
       <span class="detector-icon detector-ok">&#10003;</span>
       <div>

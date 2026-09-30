@@ -465,6 +465,23 @@ def render_text(report: Dict[str, Any], console: Optional[Console] = None) -> No
     else:
         console.print("[green]No waste patterns detected.[/green]")
 
+    # Cache TTL advisory — shown even when cache_write_churn is not triggered.
+    # This is advice only: it never adds to estimated_waste_usd and it is not
+    # a triggered waste finding. Scope: TTL-only visibility, no other redesign.
+    churn_detector = next(
+        (d for d in report["detectors"] if d["name"] == "cache_write_churn"), None
+    )
+    if churn_detector is not None and not churn_detector["triggered"]:
+        ttl_tokens = churn_detector["details"].get("ttl_rewrite_tokens", 0)
+        ttl_usd = churn_detector["details"].get("ttl_rewrite_usd", 0.0)
+        if ttl_tokens > 0:
+            console.print(
+                f"[cyan]💡 Cache TTL advice: {ttl_tokens:,} token(s) were rewritten after "
+                f"the 5-min cache expired (write-minus-read difference {_fmt_usd(ttl_usd)}). A 1-hour "
+                "cache TTL may save part of this amount. Advisory only — not counted as waste this "
+                "period.[/cyan]"
+            )
+
     # Context composition — shown before models to explain where tokens go
     context_driver_rows = report.get("cost_by_context_driver", [])
     if context_driver_rows:

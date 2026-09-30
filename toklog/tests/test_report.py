@@ -14,6 +14,8 @@ import toklog.logger as logger_mod
 import toklog.pricing as pricing_mod
 from toklog.logger import _is_benchmark_entry, log_entry
 from toklog.report import _classify_key_hint, _compute_cost, _fmt_usd, compute_spend_trend, generate_report, render_json, render_text
+from click.testing import CliRunner
+from toklog.cli import cli as toklog_cli
 
 
 @pytest.fixture(autouse=True)
@@ -1115,3 +1117,92 @@ class TestBudgetReport:
             assert ansi_codes[expected_color] in output, (
                 f"Expected {expected_color} ANSI code for spend=${spend}, got: {output[:200]}"
             )
+
+
+class TestTtlOnlyAdvisoryCli:
+    """Part B (REVIEW_FIXES.md): the TTL advisory must appear even when
+    cache_write_churn is not triggered, via the real render/CLI entrypoint.
+    """
+
+    def _log_three_spaced_anthropic_calls(self) -> None:
+        """Three calls, 20 minutes apart, same namespace, cr=0/cc=5000 each.
+
+        Call 1 is a first write. Calls 2 and 3 rewrite the same cached
+        content after a 1200s gap — over the 300s live-churn TTL but under
+        the 3600s unclassified cutoff, so they land in ttl_rewrite, not
+        live_churn. No live cache-write churn is produced.
+        """
+        base = "2026-04-07T10:{:02d}:00.000Z"
+        for i, minute in enumerate((0, 20, 40)):
+            log_entry(
+                _sample_entry(
+                    provider="anthropic",
+                    model="claude-sonnet-4-6",
+                    request_id=f"req_{i}",
+                    timestamp=base.format(minute),
+                    input_tokens=3,
+                    cache_read_tokens=0,
+                    cache_creation_tokens=5000,
+                    total_message_chars=500 + i * 100,
+                    system_prompt_hash="ns1",
+                )
+            )
+
+    @pytest.fixture(autouse=True)
+    def _tmp_gain_file(self, tmp_path: Path):
+        """Never touch the real ~/.toklog/gain.json from a CLI test."""
+        with patch("toklog.gain._GAIN_FILE", tmp_path / "gain.json"):
+            yield
+
+    def test_json_report_exposes_ttl_advice_without_triggering(self) -> None:
+        """generate_report + render_json already expose the finding; this
+        confirms the underlying data the CLI text path must also surface.
+        """
+        self._log_three_spaced_anthropic_calls()
+        report = generate_report(last="all")
+        churn = next(d for d in report["detectors"] if d["name"] == "cache_write_churn")
+        assert churn["triggered"] is False
+        assert churn["details"]["ttl_rewrite_tokens"] > 0
+        assert churn["details"]["live_churn_tokens"] == 0
+        assert churn["estimated_waste_usd"] == 0.0
+
+    def test_real_cli_report_shows_ttl_advisory_with_zero_waste(self) -> None:
+        """Real Click CLI entrypoint (toklog.cli.cli) run through generate_report:
+        the TTL advisory line appears, the churn detector is not counted in
+        the Waste Detectors table, and it adds zero dollars to total waste.
+        """
+        self._log_three_spaced_anthropic_calls()
+        runner = CliRunner()
+        result = runner.invoke(toklog_cli, ["report", "--last", "all"])
+        assert result.exit_code == 0, result.output
+        assert "Cache TTL advice" in result.output
+        assert "not counted as waste" in result.output
+        # The dollar-figure Waste Detectors table must not list cache_write_churn —
+        # it is advisory only, since triggered is False for this namespace.
+        assert "cache_write_churn" not in result.output.split("Cache TTL advice")[0]
+
+    def test_html_report_shows_ttl_advisory_with_zero_waste(self) -> None:
+        from toklog.share import generate_html
+
+        self._log_three_spaced_anthropic_calls()
+        report = generate_report(last="all")
+        html = generate_html(report)
+        assert report["estimated_waste_usd"] == pytest.approx(0.0)
+        assert "Cache TTL advice" in html
+        assert "advisory only, not counted as waste" in html
+        assert "write-minus-read difference" in html
+        assert "may save part of this amount" in html
+
+    def test_real_cli_report_json_format_includes_advisory_data(self) -> None:
+        """--format json must still include the raw ttl_rewrite fields so a
+        caller building their own renderer can show the same advice.
+        """
+        self._log_three_spaced_anthropic_calls()
+        runner = CliRunner()
+        result = runner.invoke(toklog_cli, ["report", "--last", "all", "--format", "json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        churn = next(d for d in data["detectors"] if d["name"] == "cache_write_churn")
+        assert churn["triggered"] is False
+        assert churn["details"]["ttl_rewrite_tokens"] > 0
+        assert data["estimated_waste_usd"] == pytest.approx(0.0)

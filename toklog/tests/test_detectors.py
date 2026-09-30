@@ -794,6 +794,58 @@ class TestClassifyCacheWritesGoodCaching:
         assert "Not counted as waste" in result.description
 
 
+class TestClassifyCacheWritesLimitation:
+    """REVIEW_FIXES.md finding 3: message-size/effective-prompt thread matching
+    is an inference, not conversation identity. Two independent, healthy
+    conversations sharing one namespace can still be mis-threaded together,
+    producing an inferred churn estimate although neither real conversation
+    wasted any cache tokens. This is a documented, accepted limitation of the
+    approved inference — the fixture below pins the CURRENT inferred number
+    so a future change to the inference is visible, not to assert it is zero.
+    """
+
+    def test_two_independent_conversations_false_positive_is_documented(self) -> None:
+        """Four calls, same namespace, two real independent conversations A/B:
+        A1 t=0 msg=500 cr=0 cc=1000; B1 t=10 msg=700 cr=0 cc=1600;
+        A2 t=20 msg=600 cr=1000 cc=200; B2 t=30 msg=800 cr=1600 cc=100.
+
+        Neither real conversation (A1->A2, B1->B2) ever rewrote its own
+        cache: A2 reads exactly what A1 wrote, B2 reads exactly what B1
+        wrote. The detector cannot see conversation identity — it only sees
+        growing message length and growing effective prompt length — so it
+        currently threads B1 under a candidate later claimed by A2/B2's msg
+        ordering and reports 1000 live-churn tokens. This is a known false
+        positive, not proof of real waste.
+        """
+        entries = [
+            _anthro_entry(system_prompt_hash="limA", input_tokens=3,
+                           cache_read_tokens=0, cache_creation_tokens=1000, total_message_chars=500,
+                           timestamp="2025-03-09T10:00:00.000Z"),  # A1
+            _anthro_entry(system_prompt_hash="limA", input_tokens=3,
+                           cache_read_tokens=0, cache_creation_tokens=1600, total_message_chars=700,
+                           timestamp="2025-03-09T10:00:10.000Z"),  # B1
+            _anthro_entry(system_prompt_hash="limA", input_tokens=3,
+                           cache_read_tokens=1000, cache_creation_tokens=200, total_message_chars=600,
+                           timestamp="2025-03-09T10:00:20.000Z"),  # A2 (reads exactly A1's write)
+            _anthro_entry(system_prompt_hash="limA", input_tokens=3,
+                           cache_read_tokens=1600, cache_creation_tokens=100, total_message_chars=800,
+                           timestamp="2025-03-09T10:00:30.000Z"),  # B2 (reads exactly B1's write)
+        ]
+        result = detect_cache_write_churn(entries)
+
+        # Current inferred result: pinned, not a target to tune toward or away from.
+        assert result.details["live_churn_tokens"] == 1000
+        assert result.triggered is True
+        assert result.estimated_waste_usd > 0
+
+        # The visible dollar estimate must carry the uncertainty qualification
+        # right next to it — not just a bare number.
+        assert "Possible live-cache rewrites inferred from message-size matching" in result.description
+        assert "Independent conversations can cause false positives" in result.description
+        assert "does not confirm avoidable savings" in result.description
+        assert f"${result.estimated_waste_usd:.4f}" in result.description
+
+
 class TestClassifyCacheWritesLiveChurn:
     def test_live_rewrite_exact_token_split(self) -> None:
         """gap 60s, previous L=100k, now cr=40k cc=70k → 60k live churn, 10k incremental."""

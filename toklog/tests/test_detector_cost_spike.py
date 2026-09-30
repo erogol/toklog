@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 import pytest
 
 import toklog.pricing as pricing_mod
-from toklog.detectors import detect_cost_spike, _entry_cost
+from toklog.detectors import detect_cost_spike, _entry_cost, _classify_cache_writes, _counted_live_churn_usd
 
 
 # ---------------------------------------------------------------------------
@@ -366,3 +366,108 @@ class TestCostSpikeChurnOverlap:
         result = det.detect_cost_spike(entries)
         unchanged = next(s for s in result.details["spikes"] if s["index"] == idx)
         assert unchanged["excess_usd"] == pytest.approx(full_excess)
+
+
+class TestCostSpikeChurnOverlapRealClassifier:
+    """REVIEW_FIXES.md finding 4: the three tests above mock
+    _counted_live_churn_usd, so they never exercise the real classifier
+    wiring or the <3-call exclusion end to end. These two tests call the
+    real _classify_cache_writes / _counted_live_churn_usd — no mocks — and
+    check detect_cost_spike's subtraction against that real output.
+    """
+
+    def test_real_classifier_live_churn_reduces_real_spike(self) -> None:
+        """A >=3-classifiable-call namespace where the spike call itself
+        rewrites a just-cached prefix: the real classifier assigns it a
+        nonzero live_churn_usd, and detect_cost_spike's excess_usd is
+        reduced by exactly that real counted amount."""
+        hash_ = "realchurnA"
+        baseline = [
+            _entry(
+                input_tokens=3, output_tokens=50,
+                cache_read_tokens=0, cache_creation_tokens=1000,
+                system_prompt_hash=hash_,
+                total_message_chars=500,
+                timestamp=f"2026-04-07T10:{i:02d}:00Z",
+            )
+            for i in range(5)
+        ]
+        spike_entry = _entry(
+            input_tokens=3, output_tokens=5000,
+            cache_read_tokens=500, cache_creation_tokens=300000,
+            system_prompt_hash=hash_,
+            total_message_chars=600,
+            timestamp="2026-04-07T10:05:00Z",  # 60s after the last baseline call
+        )
+        entries = baseline + [spike_entry]
+        idx = len(entries) - 1
+
+        # Real classifier: the spike's own thread had last_L=1000 (from the
+        # last baseline write) and cr=500 < last_L, within the 300s live-churn
+        # TTL, so miss = last_L - cr = 500 tokens counted as live churn.
+        rows = _classify_cache_writes(entries)
+        assert rows[idx]["live_churn_tokens"] == 500
+
+        counted = _counted_live_churn_usd(entries)
+        assert idx in counted
+        real_churn_usd = counted[idx]
+        assert real_churn_usd > 0
+
+        result = detect_cost_spike(entries)
+        spike = next(s for s in result.details["spikes"] if s["index"] == idx)
+
+        # Independently derive the pre-subtraction excess from real cost and
+        # the real session Q3 (all 5 baseline entries share one identical
+        # cost, so Q3 == that baseline cost exactly).
+        cost = _entry_cost(spike_entry)
+        baseline_cost = _entry_cost(baseline[0])
+        full_excess = min(cost - baseline_cost, cost)
+        assert full_excess > real_churn_usd  # the spike is not fully absorbed by churn
+
+        assert spike["excess_usd"] == pytest.approx(round(full_excess - real_churn_usd, 4))
+        assert spike["excess_usd"] > 0
+
+    def test_real_classifier_small_namespace_spike_not_subtracted(self) -> None:
+        """Positive inferred churn in a two-call namespace is not subtracted."""
+        baseline = [
+            _entry(
+                input_tokens=100, output_tokens=50,
+                cache_read_tokens=0, cache_creation_tokens=0,
+                system_prompt_hash="realbaselineB",
+                total_message_chars=200,
+                timestamp=f"2026-04-07T11:{i:02d}:00Z",
+            )
+            for i in range(8)
+        ]
+        first_write = _entry(
+            input_tokens=3, output_tokens=50,
+            cache_read_tokens=0, cache_creation_tokens=1000,
+            system_prompt_hash="realsmallB",
+            total_message_chars=500,
+            timestamp="2026-04-07T11:09:00Z",
+        )
+        spike_entry = _entry(
+            input_tokens=250000, output_tokens=5000,
+            cache_read_tokens=500, cache_creation_tokens=300000,
+            system_prompt_hash="realsmallB",
+            total_message_chars=900,
+            timestamp="2026-04-07T11:10:00Z",
+        )
+        entries = baseline + [first_write, spike_entry]
+        idx = len(entries) - 1
+
+        rows = _classify_cache_writes(entries)
+        assert rows[idx]["live_churn_tokens"] == 500
+        assert rows[idx]["live_churn_usd"] > 0
+        assert sum(row["namespace"] == rows[idx]["namespace"] for row in rows.values()) == 2
+        counted = _counted_live_churn_usd(entries)
+        assert idx not in counted
+        assert idx - 1 not in counted
+
+        result = detect_cost_spike(entries)
+        spike = next(s for s in result.details["spikes"] if s["index"] == idx)
+
+        cost = _entry_cost(spike_entry)
+        baseline_cost = _entry_cost(baseline[0])
+        full_excess = min(cost - baseline_cost, cost)
+        assert spike["excess_usd"] == pytest.approx(round(full_excess, 4))

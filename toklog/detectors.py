@@ -469,8 +469,10 @@ def detect_cache_write_churn(entries: List[Dict[str, Any]]) -> DetectorResult:
 
     if triggered:
         description_parts = [
-            f"{flagged_namespaces} cache namespace(s) rewrote a live prompt cache instead of "
-            f"reading it. Estimated live cache-rewrite waste: ${waste:.4f}."
+            f"Possible live-cache rewrites inferred from message-size matching across "
+            f"{flagged_namespaces} cache namespace(s). Estimated potential waste: ${waste:.4f}. "
+            "Independent conversations can cause false positives. This estimate does not "
+            "confirm avoidable savings."
         ]
     else:
         description_parts = ["No cache write churn detected."]
@@ -482,7 +484,10 @@ def detect_cache_write_churn(entries: List[Dict[str, Any]]) -> DetectorResult:
             "save part of this. Not counted as waste."
         )
 
-    description_parts.append(f"({coverage_pct}% of calls are Anthropic with system_prompt_hash.)")
+    description_parts.append(
+        f"({coverage_pct}% of calls are classifiable: anthropic provider, a system_prompt_hash, "
+        "no error, a parseable timestamp, and total_message_chars metadata.)"
+    )
 
     return DetectorResult(
         name="cache_write_churn",

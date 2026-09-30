@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
@@ -185,6 +185,58 @@ class TestReadLogs:
         end = datetime(2026, 12, 31, tzinfo=timezone.utc)
         entries = read_logs(start_date=start, end_date=end)
         assert {e["request_id"] for e in entries} == {"no_ts", "bad_ts"}
+
+    def test_naive_start_date_treated_as_utc(self) -> None:
+        """A naive start_date is treated as UTC, not rejected with a TypeError."""
+        today = datetime.now(timezone.utc).date()
+        log_entry(_sample_entry(request_id="early", timestamp=f"{today}T01:00:00.000Z"))
+        log_entry(_sample_entry(request_id="late", timestamp=f"{today}T23:00:00.000Z"))
+        naive_start = datetime(today.year, today.month, today.day, 12, 0, 0)
+        entries = read_logs(start_date=naive_start)
+        assert [e["request_id"] for e in entries] == ["late"]
+
+    def test_naive_end_date_treated_as_utc(self) -> None:
+        """A naive end_date is treated as UTC, not rejected with a TypeError."""
+        today = datetime.now(timezone.utc).date()
+        log_entry(_sample_entry(request_id="early", timestamp=f"{today}T01:00:00.000Z"))
+        log_entry(_sample_entry(request_id="late", timestamp=f"{today}T23:00:00.000Z"))
+        naive_end = datetime(today.year, today.month, today.day, 12, 0, 0)
+        entries = read_logs(end_date=naive_end)
+        assert [e["request_id"] for e in entries] == ["early"]
+
+    def test_aware_offset_start_date_converted_to_utc(self) -> None:
+        """An aware start_date in a non-UTC offset converts to UTC first.
+
+        17:00 at UTC+5 equals 12:00 UTC, the same bound as the naive test.
+        """
+        today = datetime.now(timezone.utc).date()
+        log_entry(_sample_entry(request_id="early", timestamp=f"{today}T01:00:00.000Z"))
+        log_entry(_sample_entry(request_id="late", timestamp=f"{today}T23:00:00.000Z"))
+        tz_plus5 = timezone(timedelta(hours=5))
+        aware_start = datetime(today.year, today.month, today.day, 17, 0, 0, tzinfo=tz_plus5)
+        entries = read_logs(start_date=aware_start)
+        assert [e["request_id"] for e in entries] == ["late"]
+
+    def test_start_date_normalizes_across_utc_day_boundary(self) -> None:
+        """A bound whose local calendar date differs from its UTC calendar date
+        must use the UTC-normalized date for file pruning, not the bound's own
+        local date — otherwise a whole day's log file would be dropped.
+
+        2026-10-01T01:00:00+05:00 equals 2026-09-30T20:00:00Z: the bound's
+        local date is Oct 1, but its UTC date is Sep 30.
+        """
+        log_dir = Path(logger_mod._LOG_DIR)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps(_sample_entry(request_id="kept_after_bound", timestamp="2026-09-30T21:00:00.000Z")),
+            json.dumps(_sample_entry(request_id="dropped_before_bound", timestamp="2026-09-30T05:00:00.000Z")),
+        ]
+        (log_dir / "2026-09-30.jsonl").write_text("\n".join(lines) + "\n")
+
+        tz_plus5 = timezone(timedelta(hours=5))
+        start = datetime(2026, 10, 1, 1, 0, 0, tzinfo=tz_plus5)
+        entries = read_logs(start_date=start)
+        assert [e["request_id"] for e in entries] == ["kept_after_bound"]
 
 
 class TestIsBenchmarkEntry:

@@ -106,11 +106,29 @@ def _parse_ts(value: Any) -> Optional[datetime]:
     return parsed
 
 
+def _normalize_bound(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a start_date/end_date bound to an aware UTC datetime.
+
+    A naive bound (no tzinfo) is treated as already being in UTC. An
+    aware bound is converted to UTC with astimezone. None passes through
+    unchanged. Entry timestamps from _parse_ts are always aware UTC, so
+    comparing them against a naive bound raises TypeError unless the
+    bound is normalized first.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def read_logs(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
 ) -> list:
     """Read all log entries within date range. Returns list of dicts."""
+    start_date = _normalize_bound(start_date)
+    end_date = _normalize_bound(end_date)
     entries: list = []
     log_dir = Path(_LOG_DIR)
     if not log_dir.exists():
